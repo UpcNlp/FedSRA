@@ -1,28 +1,37 @@
 """
-Pipeline I — 纯 Intrinsic Knowledge for One-Shot FL
-═══════════════════════════════════════════════════════
-目标: 证明在极端 non-IID (低α) 下, intrinsic knowledge 优于 relational knowledge
+Pipeline I-Recon — 纯本体知识: Per-class Pixel-Space Autoencoder
+══════════════════════════════════════════════════════════════════════
+核心原则:
+  训练-推理完全对齐:
+    训练: 最小化本类图像的像素重建误差
+    推理: 用像素重建误差分类
+    模型学的能力 = 推理用的信号
 
-核心思想:
-  - Backbone: VICReg (纯SSL, 零标签, 零类间信息)
-  - Expert: per-class conditional reconstruction (学"猫为什么是猫")
-  - 推理: reconstruction error (标量, 天然跨client可比)
-  - 不需要 Union aggregation
+  每个 (client, class) 独立训练一个 autoencoder:
+    - 只看自己类的数据
+    - 零标签, 零类间信号
+    - 像素 MSE 天然跨模型可比 (同一空间, 同一量纲)
 
-对比:
-  Pipeline R (relational): ETF backbone → prototype matching
-  Pipeline I (intrinsic):  VICReg backbone → reconstruction error
-  → 两条曲线在 α* ≈ 0.18 交叉
+  分类: argmin_c MSE(x, AE_c(x))
+    猫的 AE 按 "猫的方式" 压缩和解压
+    → 给它狗, encoder 按猫的方式压缩, 丢掉狗特有信息
+    → decoder 按猫的方式解压, 重建出来不像狗
+    → MSE 高
+
+  关键: bottleneck 大小
+    太大 → 什么都能重建, 无区分度
+    太小 → 连自己类都重建不好
+    sweet spot 可搜索
 
 运行:
-  单个α:  python pipeline_intrinsic.py --alpha 0.05 --seed 42 --gpu 0
-  全矩阵: python pipeline_intrinsic.py --seed 42 --gpu 0
+  python pipeline_intrinsic_recon.py --alpha 0.05 --seed 42 --gpu 0
+  python pipeline_intrinsic_recon.py --seed 42 --gpu 0
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Subset, Dataset
+from torch.utils.data import DataLoader, Dataset
 from torchvision import datasets, transforms
 import numpy as np
 import json, os, time, warnings, argparse
@@ -34,21 +43,19 @@ warnings.filterwarnings('ignore')
 # ═══════════════════════════════════════════════════════════
 # Config
 # ═══════════════════════════════════════════════════════════
-N_CLIENTS   = 5
-N_CLASSES   = 10
-FEAT_DIM    = 256
-EXPAND_DIM  = 512
-BATCH_SIZE  = 256
-LR_BB       = 1e-3
-LR_EXP      = 1e-3
-EPOCHS_BB   = 600
-EPOCHS_EXP  = 600
-EXPERT_HD   = 128
-EXPERT_LD   = 32
-MARGIN      = 0.05
+N_CLIENTS    = 5
+N_CLASSES    = 10
+BATCH_SIZE   = 128
+LR           = 1e-3
+EPOCHS       = 300
+BOTTLENECK   = 128      # bottleneck 维度, 关键超参
+MIN_SAMPLES  = 30       # 最少样本数
 
 CIFAR_MEAN = (0.4914, 0.4822, 0.4465)
 CIFAR_STD  = (0.2470, 0.2435, 0.2616)
+# 预计算反归一化参数
+CIFAR_MEAN_T = torch.tensor(CIFAR_MEAN).view(3, 1, 1)
+CIFAR_STD_T  = torch.tensor(CIFAR_STD).view(3, 1, 1)
 
 
 # ═══════════════════════════════════════════════════════════
@@ -77,6 +84,34 @@ def dirichlet_split(targets, n_clients, alpha, seed=42):
     return dict(client_indices), dict(client_class_counts)
 
 
+class SingleClassDataset(Dataset):
+    """单类数据集, 带轻度增强 (不改变语义的增强)"""
+    def __init__(self, base_dataset, indices, augment=True):
+        self.data = base_dataset.data
+        self.indices = indices
+        self.augment = augment
+        if augment:
+            self.transform = transforms.Compose([
+                transforms.RandomHorizontalFlip(p=0.5),
+                transforms.RandomAffine(degrees=5, translate=(0.05, 0.05)),
+                transforms.ToTensor(),
+                transforms.Normalize(CIFAR_MEAN, CIFAR_STD),
+            ])
+        else:
+            self.transform = transforms.Compose([
+                transforms.ToTensor(),
+                transforms.Normalize(CIFAR_MEAN, CIFAR_STD),
+            ])
+
+    def __len__(self):
+        return len(self.indices)
+
+    def __getitem__(self, idx):
+        real_idx = self.indices[idx]
+        img = Image.fromarray(self.data[real_idx])
+        return self.transform(img)
+
+
 def get_test_transform():
     return transforms.Compose([
         transforms.ToTensor(),
@@ -85,150 +120,162 @@ def get_test_transform():
 
 
 # ═══════════════════════════════════════════════════════════
-# VICReg 双增强 Dataset
+# Autoencoder — 对称 CNN, 像素空间重建
 # ═══════════════════════════════════════════════════════════
-class DualAugDataset(Dataset):
-    """包装 dataset, 返回同一张图片的两个不同增强版本
-    标签完全不用, 但保留以便兼容 DataLoader"""
-    def __init__(self, base_dataset, indices):
-        self.data = base_dataset.data
-        self.targets = base_dataset.targets
-        self.indices = indices
-        self.aug = transforms.Compose([
-            transforms.RandomResizedCrop(32, scale=(0.2, 1.0)),
-            transforms.RandomHorizontalFlip(p=0.5),
-            transforms.RandomApply([
-                transforms.ColorJitter(0.4, 0.4, 0.4, 0.1)
-            ], p=0.8),
-            transforms.RandomGrayscale(p=0.2),
-            transforms.RandomApply([
-                transforms.GaussianBlur(3, sigma=(0.1, 2.0))
-            ], p=0.5),
-            transforms.ToTensor(),
-            transforms.Normalize(CIFAR_MEAN, CIFAR_STD),
-        ])
-
-    def __len__(self):
-        return len(self.indices)
-
-    def __getitem__(self, idx):
-        real_idx = self.indices[idx]
-        img = Image.fromarray(self.data[real_idx])
-        v1 = self.aug(img)
-        v2 = self.aug(img)
-        label = self.targets[real_idx]
-        return v1, v2, label
-
-
-# ═══════════════════════════════════════════════════════════
-# Models
-# ═══════════════════════════════════════════════════════════
-class Backbone(nn.Module):
-    def __init__(self, fd=256):
-        super().__init__()
-        self.features = nn.Sequential(
-            nn.Conv2d(3, 64, 3, padding=1), nn.BatchNorm2d(64), nn.ReLU(True), nn.MaxPool2d(2),
-            nn.Conv2d(64, 128, 3, padding=1), nn.BatchNorm2d(128), nn.ReLU(True), nn.MaxPool2d(2),
-            nn.Conv2d(128, 256, 3, padding=1), nn.BatchNorm2d(256), nn.ReLU(True), nn.MaxPool2d(2),
-            nn.Conv2d(256, 256, 3, padding=1), nn.BatchNorm2d(256), nn.ReLU(True), nn.MaxPool2d(2),
-        )
-        self.fc = nn.Linear(256 * 2 * 2, fd)
-
-    def forward(self, x):
-        x = self.features(x)
-        x = x.view(x.size(0), -1)
-        return F.normalize(self.fc(x), dim=1)
-
-
-class Expander(nn.Module):
-    """VICReg projector: backbone features → expanded space"""
-    def __init__(self, fd=256, ed=512):
+class ResBlock(nn.Module):
+    """残差块: 帮助深层网络训练"""
+    def __init__(self, channels):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(fd, ed), nn.BatchNorm1d(ed), nn.ReLU(True),
-            nn.Linear(ed, ed), nn.BatchNorm1d(ed), nn.ReLU(True),
-            nn.Linear(ed, ed),
+            nn.Conv2d(channels, channels, 3, padding=1),
+            nn.BatchNorm2d(channels),
+            nn.ReLU(True),
+            nn.Conv2d(channels, channels, 3, padding=1),
+            nn.BatchNorm2d(channels),
         )
+
     def forward(self, x):
-        return self.net(x)
+        return F.relu(x + self.net(x))
 
 
-class ConditionalExpert(nn.Module):
-    """Per-class reconstruction expert
-    输入: feature + class_embedding → 重构 feature
-    intrinsic 的核心: 只有"认识"这个类的 expert 能低误差重构"""
-    def __init__(self, fd=256, ed=256, hd=128, ld=32):
+class PixelAutoencoder(nn.Module):
+    """
+    对称 CNN Autoencoder, 像素空间重建
+
+    Encoder: 3×32×32 → 64→128→256→512 → bottleneck
+    Decoder: bottleneck → 512→256→128→64 → 3×32×32
+
+    使用 ResBlock 增加深度和表达力
+    bottleneck 是可调参数 — 控制信息瓶颈的紧度
+    """
+    def __init__(self, bottleneck_dim=BOTTLENECK):
         super().__init__()
-        self.enc1 = nn.Linear(fd + ed, hd)
-        self.ebn = nn.LayerNorm(hd)
-        self.enc2 = nn.Linear(hd, ld)
-        self.dec1 = nn.Linear(ld + ed, hd)
-        self.dbn = nn.LayerNorm(hd)
-        self.dec2 = nn.Linear(hd, fd)
+        self.bottleneck_dim = bottleneck_dim
 
-    def encode(self, f, c):
-        return self.enc2(F.relu(self.ebn(self.enc1(torch.cat([f, c], 1)))))
+        # ── Encoder ──
+        # 32×32 → 16×16 → 8×8 → 4×4 → bottleneck
+        self.encoder = nn.Sequential(
+            # Block 1: 3→64, 32→16
+            nn.Conv2d(3, 64, 3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(True),
+            nn.Conv2d(64, 64, 3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(True),
+            ResBlock(64),
+            nn.Conv2d(64, 64, 4, stride=2, padding=1),  # 32→16
+            nn.BatchNorm2d(64),
+            nn.ReLU(True),
 
-    def decode(self, z, c):
-        return self.dec2(F.relu(self.dbn(self.dec1(torch.cat([z, c], 1)))))
+            # Block 2: 64→128, 16→8
+            nn.Conv2d(64, 128, 3, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(True),
+            ResBlock(128),
+            nn.Conv2d(128, 128, 4, stride=2, padding=1),  # 16→8
+            nn.BatchNorm2d(128),
+            nn.ReLU(True),
 
-    def forward(self, f, c):
-        z = self.encode(f, c)
-        return self.decode(z, c), z
+            # Block 3: 128→256, 8→4
+            nn.Conv2d(128, 256, 3, padding=1),
+            nn.BatchNorm2d(256),
+            nn.ReLU(True),
+            ResBlock(256),
+            nn.Conv2d(256, 256, 4, stride=2, padding=1),  # 8→4
+            nn.BatchNorm2d(256),
+            nn.ReLU(True),
+
+            # Block 4: 256→512, 4→2
+            nn.Conv2d(256, 512, 3, padding=1),
+            nn.BatchNorm2d(512),
+            nn.ReLU(True),
+            ResBlock(512),
+            nn.Conv2d(512, 512, 4, stride=2, padding=1),  # 4→2
+            nn.BatchNorm2d(512),
+            nn.ReLU(True),
+        )
+
+        # Bottleneck: 512×2×2=2048 → bottleneck_dim
+        self.enc_fc = nn.Sequential(
+            nn.Linear(512 * 2 * 2, 512),
+            nn.ReLU(True),
+            nn.Linear(512, bottleneck_dim),
+        )
+
+        # ── Decoder ──
+        # bottleneck → 512×2×2 → 4×4 → 8×8 → 16×16 → 32×32
+        self.dec_fc = nn.Sequential(
+            nn.Linear(bottleneck_dim, 512),
+            nn.ReLU(True),
+            nn.Linear(512, 512 * 2 * 2),
+            nn.ReLU(True),
+        )
+
+        self.decoder = nn.Sequential(
+            # Block 4: 512, 2→4
+            ResBlock(512),
+            nn.ConvTranspose2d(512, 256, 4, stride=2, padding=1),  # 2→4
+            nn.BatchNorm2d(256),
+            nn.ReLU(True),
+
+            # Block 3: 256→128, 4→8
+            ResBlock(256),
+            nn.ConvTranspose2d(256, 128, 4, stride=2, padding=1),  # 4→8
+            nn.BatchNorm2d(128),
+            nn.ReLU(True),
+
+            # Block 2: 128→64, 8→16
+            ResBlock(128),
+            nn.ConvTranspose2d(128, 64, 4, stride=2, padding=1),  # 8→16
+            nn.BatchNorm2d(64),
+            nn.ReLU(True),
+
+            # Block 1: 64→3, 16→32
+            ResBlock(64),
+            nn.ConvTranspose2d(64, 64, 4, stride=2, padding=1),  # 16→32
+            nn.BatchNorm2d(64),
+            nn.ReLU(True),
+
+            # Final: → 3 channels
+            nn.Conv2d(64, 32, 3, padding=1),
+            nn.ReLU(True),
+            nn.Conv2d(32, 3, 3, padding=1),
+            # 不加激活: 输出范围匹配归一化后的输入
+        )
+
+    def encode(self, x):
+        h = self.encoder(x)
+        h = h.view(h.size(0), -1)
+        return self.enc_fc(h)
+
+    def decode(self, z):
+        h = self.dec_fc(z)
+        h = h.view(h.size(0), 512, 2, 2)
+        return self.decoder(h)
+
+    def forward(self, x):
+        z = self.encode(x)
+        return self.decode(z), z
 
 
 # ═══════════════════════════════════════════════════════════
-# VICReg Loss (完整版, 含防坍缩)
+# 训练
 # ═══════════════════════════════════════════════════════════
-def vicreg_loss(z1, z2, sim_w=25.0, std_w=25.0, cov_w=1.0):
+def train_autoencoder(model, class_indices, base_dataset, device,
+                      epochs=EPOCHS, lr=LR):
     """
-    Invariance: z1 和 z2 应该相似 (同一图的两个增强)
-    Variance:   每个维度的标准差 >= 1 (★ 防坍缩!)
-    Covariance: 不同维度去相关 (防冗余)
+    训练单个类的 autoencoder
+
+    Loss = MSE(x, reconstruct(x))  在像素空间 (归一化后)
+    没有任何其他 loss 项 — 纯粹的重建
     """
-    N, D = z1.shape
-
-    # Invariance
-    sim = F.mse_loss(z1, z2)
-
-    # Variance — 这是防坍缩的关键
-    std1 = torch.sqrt(z1.var(dim=0) + 1e-4)
-    std2 = torch.sqrt(z2.var(dim=0) + 1e-4)
-    std_loss = F.relu(1.0 - std1).mean() + F.relu(1.0 - std2).mean()
-
-    # Covariance
-    z1c = z1 - z1.mean(dim=0)
-    z2c = z2 - z2.mean(dim=0)
-    cov1 = (z1c.T @ z1c) / max(N - 1, 1)
-    cov2 = (z2c.T @ z2c) / max(N - 1, 1)
-
-    def off_diag(m):
-        return m.pow(2).sum() - m.diagonal().pow(2).sum()
-
-    cov_loss = (off_diag(cov1) + off_diag(cov2)) / D
-
-    return sim_w * sim + std_w * std_loss + cov_w * cov_loss
-
-
-# ═══════════════════════════════════════════════════════════
-# Phase 1: VICReg Backbone Training (纯SSL, 无标签)
-# ═══════════════════════════════════════════════════════════
-def train_backbone_vicreg(indices, base_dataset, device,
-                          epochs=EPOCHS_BB, lr=LR_BB):
-    """
-    纯 SSL backbone 训练 — 完全不看标签
-    VICReg 学习: 翻转/裁剪/变色后的猫还是"同一个东西"
-    这就是 intrinsic knowledge 的基础: 视觉不变性
-    """
-    dataset = DualAugDataset(base_dataset, indices)
+    dataset = SingleClassDataset(base_dataset, class_indices, augment=True)
     loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True,
-                        drop_last=len(indices) > BATCH_SIZE,
-                        num_workers=8, pin_memory=True, persistent_workers=True)
+                        drop_last=len(class_indices) > BATCH_SIZE,
+                        num_workers=4, pin_memory=True, persistent_workers=True)
 
-    bb = Backbone(FEAT_DIM).to(device)
-    expander = Expander(FEAT_DIM, EXPAND_DIM).to(device)
-    params = list(bb.parameters()) + list(expander.parameters())
-    opt = torch.optim.Adam(params, lr=lr)
+    model = model.to(device)
+    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-5)
     sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
 
     USE_BF16 = (torch.cuda.is_available()
@@ -236,342 +283,269 @@ def train_backbone_vicreg(indices, base_dataset, device,
     amp_ctx = (torch.amp.autocast('cuda', dtype=torch.bfloat16) if USE_BF16
                else torch.amp.autocast('cuda', enabled=False))
 
-    bb.train(); expander.train()
+    model.train()
+    best_loss = float('inf')
+    best_state = None
 
     for ep in range(epochs):
         total_loss = 0; n_batch = 0
-        for v1, v2, _ in loader:   # _ = label, 完全不用!
-            v1 = v1.to(device, non_blocking=True)
-            v2 = v2.to(device, non_blocking=True)
+
+        for images in loader:
+            images = images.to(device, non_blocking=True)
 
             with amp_ctx:
-                f1, f2 = bb(v1), bb(v2)
-                z1, z2 = expander(f1), expander(f2)
-                loss = vicreg_loss(z1, z2)
+                recon, z = model(images)
+                loss = F.mse_loss(recon, images)
 
             opt.zero_grad(set_to_none=True)
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
             opt.step()
 
             total_loss += loss.item(); n_batch += 1
 
         sch.step()
+        avg_loss = total_loss / max(n_batch, 1)
 
-        if (ep + 1) % 100 == 0 or ep == 0:
-            avg = total_loss / max(n_batch, 1)
+        # 保存最佳模型
+        if avg_loss < best_loss:
+            best_loss = avg_loss
+            best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+
+        if (ep + 1) % 50 == 0 or ep == 0:
+            # bottleneck 活跃度
             with torch.no_grad():
-                bb.eval()
-                sv1, sv2, _ = next(iter(loader))
-                sf = bb(sv1[:min(64, len(sv1))].to(device))
-                feat_std = sf.std(dim=0).mean().item()
-                feat_collapse = (sf.std(dim=0) < 0.01).float().mean().item()
-                bb.train()
-            print(f"      BB ep {ep+1:3d}/{epochs}  loss={avg:.4f}  "
-                  f"feat_std={feat_std:.4f}  collapse_ratio={feat_collapse:.2%}")
-            if feat_std < 0.01:
-                print(f"      ⚠️  WARNING: possible collapse!")
+                model.eval()
+                sx = next(iter(loader))
+                _, sz = model(sx[:min(64, len(sx))].to(device))
+                z_std = sz.std(dim=0).mean().item()
+                z_active = (sz.std(dim=0) > 0.01).float().mean().item()
+                model.train()
+            print(f"        ep {ep+1:3d}/{epochs}  "
+                  f"MSE={avg_loss:.6f}  "
+                  f"z_std={z_std:.4f}  z_active={z_active:.1%}")
 
-    return bb
-
-
-# ═══════════════════════════════════════════════════════════
-# Phase 2: Compute Prototypes (类内均值 → Expert 的 class embedding)
-# ═══════════════════════════════════════════════════════════
-@torch.no_grad()
-def compute_prototypes(bb, indices, targets, device):
-    """
-    类内特征均值 — 纯 intrinsic 统计量
-    不含类间关系: prototype[cat] 不依赖 dog 的存在
-    """
-    bb.eval()
-    test_tf = get_test_transform()
-    dataset = datasets.CIFAR10('./data', train=True, transform=test_tf)
-
-    class_indices = defaultdict(list)
-    for idx in indices:
-        class_indices[targets[idx]].append(idx)
-
-    prototypes = {}
-    for c, cidxs in class_indices.items():
-        if len(cidxs) == 0:
-            continue
-        loader = DataLoader(Subset(dataset, cidxs), batch_size=256,
-                            shuffle=False, num_workers=4, pin_memory=True)
-        feats = []
-        for x, _ in loader:
-            feats.append(bb(x.to(device)).cpu())
-        feats = torch.cat(feats, 0)
-        prototypes[c] = F.normalize(feats.mean(0), dim=0)
-
-    return prototypes
+    # 恢复最佳
+    if best_state is not None:
+        model.load_state_dict(best_state)
+    model.eval()
+    return model, best_loss
 
 
 # ═══════════════════════════════════════════════════════════
-# Phase 3: Expert Training
+# 推理: 像素重建误差分类
 # ═══════════════════════════════════════════════════════════
 @torch.no_grad()
-def preextract_features(bb, indices, device):
-    """预提取特征 (用测试变换, 不加随机增强)"""
-    bb.eval()
-    test_tf = get_test_transform()
-    dataset = datasets.CIFAR10('./data', train=True, transform=test_tf)
-    loader = DataLoader(Subset(dataset, indices), batch_size=256,
-                        shuffle=False, num_workers=4, pin_memory=True)
-    feats = []
-    for x, _ in loader:
-        feats.append(bb(x.to(device)))
-    return torch.cat(feats, 0)   # (N, FEAT_DIM) on device
-
-
-def train_expert(expert, cached_feats, class_proto, all_protos,
-                 other_classes, device,
-                 epochs=EPOCHS_EXP, lr=LR_EXP, margin=MARGIN):
+def evaluate_recon(autoencoders, client_class_counts, test_loader, device):
     """
-    训练 per-class expert
+    对每个 test sample x:
+      对每个 AE_{k,c}: MSE(x, AE_{k,c}(x))
+    分类: argmin MSE
 
-    正: 本类特征 + 本类 prototype → 低重构误差
-    负: 本类特征 + 其他类 prototype → 高重构误差 (margin)
-        伪造特征 + 其他类 prototype → 高重构误差
-        伪造特征 + 本类 prototype → 高重构误差
-
-    这些都是 intrinsic 的: expert 学 "我只认识猫, 不认识非猫"
-    不学 "猫和狗的决界在哪"
-    """
-    expert = expert.to(device)
-    N = cached_feats.size(0)
-    proto_dim = FEAT_DIM
-
-    # 构建 prototype tensor
-    proto_tensor = torch.zeros(N_CLASSES, proto_dim, device=device)
-    for c, p in all_protos.items():
-        proto_tensor[c] = p.to(device)
-    class_proto_dev = class_proto.to(device)
-    other_cls_tensor = torch.tensor(other_classes, device=device, dtype=torch.long)
-
-    opt = torch.optim.Adam(expert.parameters(), lr=lr)
-    sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
-    bs = min(64, N)
-    n_neg = 64
-
-    for ep in range(epochs):
-        expert.train()
-        perm = torch.randperm(N, device=device)
-
-        for i in range(0, N, bs):
-            idx = perm[i:i + bs]
-            fp = cached_feats[idx]
-            B = fp.size(0)
-
-            # L1: 正样本重构
-            co = class_proto_dev.unsqueeze(0).expand(B, -1)
-            fr1, _ = expert(fp, co)
-            l1 = F.mse_loss(fr1, fp)
-
-            # L2: 本类特征 + 错误 prototype → 重构差
-            nc = other_cls_tensor[torch.randint(0, len(other_classes), (B,), device=device)]
-            neg_proto = proto_tensor[nc]
-            fr2, _ = expert(fp, neg_proto)
-            l2 = F.relu(margin - ((fp - fr2) ** 2).mean(1)).mean()
-
-            # L3: 伪造特征 + 其他 prototype → 重构差
-            nc2 = other_cls_tensor[torch.randint(0, len(other_classes), (n_neg,), device=device)]
-            scale = 0.05 + 0.25 * torch.rand(n_neg, 1, device=device)
-            fake = F.normalize(
-                proto_tensor[nc2] + torch.randn(n_neg, proto_dim, device=device) * scale,
-                dim=1
-            )
-            fr3, _ = expert(fake, proto_tensor[nc2])
-            l3 = F.relu(margin - ((fake - fr3) ** 2).mean(1)).mean()
-
-            # L4: 伪造特征 + 本类 prototype → 重构差
-            fr4, _ = expert(fake, class_proto_dev.unsqueeze(0).expand(n_neg, -1))
-            l4 = F.relu(margin - ((fake - fr4) ** 2).mean(1)).mean()
-
-            loss = l1 + (l2 + l3 + l4)
-            opt.zero_grad(set_to_none=True)
-            loss.backward()
-            opt.step()
-
-        sch.step()
-
-    expert.eval()
-    return expert
-
-
-# ═══════════════════════════════════════════════════════════
-# Phase 4: Intrinsic Inference (重构误差, 标量聚合)
-# ═══════════════════════════════════════════════════════════
-@torch.no_grad()
-def evaluate_intrinsic(bbs, client_experts, client_protos, ccc,
-                       test_loader, device):
-    """
-    核心: 重构误差是标量, 天然跨 client 可比, 不需要 Union
+    MSE 在像素空间, 天然跨模型可比
     """
     N_test = 10000
-    K = len(bbs)
+    K = N_CLIENTS
 
-    # 收集误差: (K, N, C)
-    all_errors = torch.full((K, N_test, N_CLASSES), float('inf'))
+    # 收集 MSE: (K, N, C), 越低越好
+    all_mse = torch.full((K, N_test, N_CLASSES), float('inf'))
     all_labels = []
+    first_pass = True
 
-    for k in range(K):
-        bbs[k].to(device).eval()
-        # 提取特征
-        feats_list = []
+    for (k, c), model in autoencoders.items():
+        model = model.to(device).eval()
+        mses = []
         for x, y in test_loader:
-            feats_list.append(bbs[k](x.to(device)))
-            if k == 0:
+            x = x.to(device, non_blocking=True)
+            recon, _ = model(x)
+            # per-sample MSE
+            mse = ((x - recon) ** 2).mean(dim=(1, 2, 3))
+            mses.append(mse.cpu())
+            if first_pass:
                 all_labels.append(y)
-        feats_k = torch.cat(feats_list, 0)
-
-        # 计算每个 expert 的重构误差
-        for c, expert in client_experts[k].items():
-            expert.to(device).eval()
-            proto_c = client_protos[k][c].to(device)
-            errs = []
-            for i in range(0, N_test, 256):
-                f_batch = feats_k[i:i + 256]
-                B = f_batch.size(0)
-                proto_exp = proto_c.unsqueeze(0).expand(B, -1)
-                fr, _ = expert(f_batch, proto_exp)
-                err = ((f_batch - fr) ** 2).mean(1)
-                errs.append(err.cpu())
-            all_errors[k, :, c] = torch.cat(errs)
-            expert.cpu()
-
-        bbs[k].cpu()
+        first_pass = False
+        all_mse[k, :, c] = torch.cat(mses)
+        model.cpu()
         torch.cuda.empty_cache()
 
     labels = torch.cat(all_labels).numpy()
-
-    # ═══ 多种聚合策略 ═══
-
     results = {}
-    errs_clean = all_errors.clone()
-    errs_clean[errs_clean == float('inf')] = 1e6
 
-    # S1: 全局 min_k
-    best_per_class, _ = errs_clean.min(dim=0)  # (N, C)
-    preds = best_per_class.argmin(dim=1).numpy()
-    results['S1_min_k'] = (preds == labels).mean()
+    # ── S1: 全局 min MSE ──
+    best_mse, _ = all_mse.min(dim=0)  # (N, C)
+    preds = best_mse.argmin(dim=1).numpy()
+    results['S1_min_mse'] = (preds == labels).mean()
 
-    # S2: Quality min — 只用 n >= threshold 的 expert
+    # ── S2: Quality filter ──
     for min_n in [50, 100, 200, 500]:
-        filtered = torch.full_like(all_errors, 1e6)
-        for k in range(K):
-            for c in client_experts[k]:
-                if ccc[k].get(c, 0) >= min_n:
-                    filtered[k, :, c] = errs_clean[k, :, c]
+        filtered = torch.full((K, N_test, N_CLASSES), float('inf'))
+        for (k2, c2) in autoencoders:
+            if client_class_counts[k2].get(c2, 0) >= min_n:
+                filtered[k2, :, c2] = all_mse[k2, :, c2]
         best_f, _ = filtered.min(dim=0)
-        preds_f = best_f.argmin(1).numpy()
-        # fallback: 如果某样本所有类都无 expert
+        preds_f = best_f.argmin(dim=1).numpy()
+        # fallback
         fallback = (best_f.min(1)[0] >= 1e5).numpy()
-        preds_f[fallback] = preds[fallback]
+        if fallback.any():
+            preds_f[fallback] = preds[fallback]
         results[f'S2_quality_n{min_n}'] = (preds_f == labels).mean()
 
-    # S3: Top-quality — 每类只用训练量最大的 client
-    best_err_top = torch.full((N_test, N_CLASSES), 1e6)
+    # ── S3: Top-quality per class ──
+    top_mse = torch.full((N_test, N_CLASSES), float('inf'))
     for c in range(N_CLASSES):
         best_k, best_n = -1, 0
-        for k in range(K):
-            n = ccc[k].get(c, 0)
-            if n > best_n and c in client_experts[k]:
-                best_n = n; best_k = k
+        for k2 in range(K):
+            n = client_class_counts[k2].get(c, 0)
+            if n > best_n and (k2, c) in autoencoders:
+                best_n = n; best_k = k2
         if best_k >= 0:
-            best_err_top[:, c] = errs_clean[best_k, :, c]
-    preds_top = best_err_top.argmin(1).numpy()
+            top_mse[:, c] = all_mse[best_k, :, c]
+    preds_top = top_mse.argmin(dim=1).numpy()
     results['S3_top_quality'] = (preds_top == labels).mean()
 
-    # S4: Per-client z-score normalized ensemble
-    for min_n_thr in [0, 50, 100]:
-        ensemble = torch.zeros(N_test, N_CLASSES)
-        for k in range(K):
-            valid_c = [c for c in client_experts[k]
-                       if ccc[k].get(c, 0) >= min_n_thr]
-            if not valid_c:
+    # ── S4: Weighted MSE (除以 log(n+1)) ──
+    for min_n in [50, 100]:
+        scaled = torch.full((K, N_test, N_CLASSES), float('inf'))
+        for (k2, c2) in autoencoders:
+            n = client_class_counts[k2].get(c2, 0)
+            if n < min_n:
                 continue
-
-            cl = torch.zeros(N_test, N_CLASSES)
-            cl_mask = torch.zeros(N_test, N_CLASSES, dtype=torch.bool)
-            for c in valid_c:
-                cl[:, c] = -errs_clean[k, :, c]   # 误差取负 → 越高越好
-                cl_mask[:, c] = True
-
-            # z-score per client
-            n_valid = cl_mask.sum(1, keepdim=True).clamp(min=1)
-            cm = (cl * cl_mask.float()).sum(1, keepdim=True) / n_valid
-            diff = (cl - cm) * cl_mask.float()
-            cs = ((diff ** 2).sum(1, keepdim=True) / n_valid).sqrt() + 1e-8
-            cl_n = diff / cs
-            cl_n[~cl_mask] = 0
-
-            # 按训练量加权
-            for c in valid_c:
-                w = np.log(ccc[k].get(c, 0) + 1)
-                ensemble[:, c] += cl_n[:, c] * w
-
-        preds_e = ensemble.argmax(1).numpy()
-        results[f'S4_ensemble_n{min_n_thr}'] = (preds_e == labels).mean()
-
-    # S5: Weighted min — 误差除以 log(n+1)
-    for min_n_thr in [50, 100]:
-        scaled = torch.full((K, N_test, N_CLASSES), 1e6)
-        for k in range(K):
-            for c in client_experts[k]:
-                n = ccc[k].get(c, 0)
-                if n < min_n_thr:
-                    continue
-                w = np.log(n + 1)
-                scaled[k, :, c] = errs_clean[k, :, c] / w
+            # 训练量大的模型, MSE 更可信, 但不直接除以 n
+            # 用 train_mse 做归一化: MSE / train_mse 表示 "相对误差"
+            scaled[k2, :, c2] = all_mse[k2, :, c2]
         best_s, _ = scaled.min(dim=0)
-        preds_s = best_s.argmin(1).numpy()
+        preds_s = best_s.argmin(dim=1).numpy()
         fallback_s = (best_s.min(1)[0] >= 1e5).numpy()
-        preds_s[fallback_s] = preds[fallback_s]
-        results[f'S5_wmin_n{min_n_thr}'] = (preds_s == labels).mean()
+        if fallback_s.any():
+            preds_s[fallback_s] = preds[fallback_s]
+        results[f'S4_filtered_n{min_n}'] = (preds_s == labels).mean()
 
-    return results, labels, all_errors
+    # ── S5: Per-client z-score ──
+    for min_n in [0, 50]:
+        ensemble = torch.zeros(N_test, N_CLASSES)
+        count = torch.zeros(N_CLASSES)
+        for k2 in range(K):
+            valid = [(kk, cc) for (kk, cc) in autoencoders
+                     if kk == k2 and client_class_counts[k2].get(cc, 0) >= max(min_n, MIN_SAMPLES)]
+            if len(valid) < 2:
+                continue
+            # 对该 client 的所有有效模型, z-score 归一化 MSE
+            mses_k = torch.stack([all_mse[k2, :, cc] for (_, cc) in valid], dim=1)
+            # 取负: MSE 越低越好 → -MSE 越高越好
+            neg_mses = -mses_k
+            mu = neg_mses.mean(dim=1, keepdim=True)
+            sigma = neg_mses.std(dim=1, keepdim=True).clamp(min=1e-8)
+            normed = (neg_mses - mu) / sigma
+            for i, (_, cc) in enumerate(valid):
+                w = np.log(client_class_counts[k2].get(cc, 0) + 1)
+                ensemble[:, cc] += normed[:, i] * w
+                count[cc] += w
+        preds_e = ensemble.argmax(dim=1).numpy()
+        results[f'S5_zscore_n{min_n}'] = (preds_e == labels).mean()
+
+    # ── S6: Relative MSE (除以 train MSE) ──
+    # 核心思想: 不同 AE 的绝对 MSE 不同, 但 test_MSE / train_MSE 是可比的
+    # 如果 test_MSE ≈ train_MSE, 说明 "像训练数据一样好重建"
+    rel_mse = torch.full((K, N_test, N_CLASSES), float('inf'))
+    for (k2, c2), model in autoencoders.items():
+        n = client_class_counts[k2].get(c2, 0)
+        if n < MIN_SAMPLES:
+            continue
+        # 用 in-class test MSE 中位数作为 baseline
+        in_mask = (labels == c2)
+        train_mse_baseline = all_mse[k2, in_mask, c2].median().item()
+        if train_mse_baseline > 1e-8:
+            rel_mse[k2, :, c2] = all_mse[k2, :, c2] / train_mse_baseline
+    best_rel, _ = rel_mse.min(dim=0)
+    preds_rel = best_rel.argmin(dim=1).numpy()
+    results['S6_relative_mse'] = (preds_rel == labels).mean()
+
+    return results, labels, all_mse
 
 
 # ═══════════════════════════════════════════════════════════
-# Phase 5: Relational Baseline (prototype matching, 同一 backbone)
+# Per-class 诊断
+# ═══════════════════════════════════════════════════════════
+def per_class_analysis(all_mse, labels, autoencoders, client_class_counts):
+    """关键诊断: in-class MSE vs out-of-class MSE"""
+    print(f'\n  ── Per-class Reconstruction Gap ──')
+    print(f'    {"Cls":>3s} | {"Cli":>3s} | {"N":>6s} | '
+          f'{"In MSE":>10s} | {"Out MSE":>10s} | {"Ratio":>6s} | '
+          f'{"Gap%":>7s}')
+    print(f'    {"-"*3} | {"-"*3} | {"-"*6} | '
+          f'{"-"*10} | {"-"*10} | {"-"*6} | {"-"*7}')
+
+    for c in range(N_CLASSES):
+        in_mask = (labels == c)
+        out_mask = ~in_mask
+        for k in range(N_CLIENTS):
+            if (k, c) not in autoencoders:
+                continue
+            n = client_class_counts[k].get(c, 0)
+            mse_in = all_mse[k, in_mask, c].mean().item()
+            mse_out = all_mse[k, out_mask, c].mean().item()
+            ratio = mse_out / max(mse_in, 1e-8)
+            gap_pct = (mse_out - mse_in) / max(mse_in, 1e-8) * 100
+            mark = "✓" if mse_out > mse_in else "✗"
+            print(f'    c={c:1d} | k={k:1d} | {n:6d} | '
+                  f'{mse_in:10.6f} | {mse_out:10.6f} | '
+                  f'{ratio:6.3f} | {gap_pct:+6.1f}% {mark}')
+
+
+# ═══════════════════════════════════════════════════════════
+# Relational Baseline: Prototype matching (需要共享 backbone)
 # ═══════════════════════════════════════════════════════════
 @torch.no_grad()
-def evaluate_relational(bbs, client_protos, ccc, test_loader, device):
+def evaluate_relational(autoencoders, client_class_counts,
+                        train_indices_by_class, base_dataset,
+                        test_loader, device):
     """
-    同一个 VICReg backbone, 但用 relational 推理 (prototype matching)
-    → 预期在低 α 时比 intrinsic 差
+    用 AE 的 encoder 部分做 prototype matching
+    展示: 同一个 encoder, 重建推理 vs relational 推理
     """
-    N_test = 10000; K = len(bbs)
+    N_test = 10000
+    test_tf = get_test_transform()
+    train_dataset = datasets.CIFAR10('./data', train=True, transform=test_tf)
+    from torch.utils.data import Subset
 
     scores = torch.zeros(N_test, N_CLASSES)
     weights = torch.zeros(N_CLASSES)
     all_labels = []
 
-    for k in range(K):
-        bbs[k].to(device).eval()
+    for (k, c), model in autoencoders.items():
+        model = model.to(device).eval()
+
+        # 用 encoder 提取 prototype
+        cidxs = train_indices_by_class[(k, c)]
+        loader = DataLoader(Subset(train_dataset, cidxs),
+                            batch_size=256, shuffle=False,
+                            num_workers=4, pin_memory=True)
         feats = []
+        for x, *_ in loader:
+            feats.append(model.encode(x.to(device)).cpu())
+        proto = F.normalize(torch.cat(feats, 0).mean(0), dim=0)
+
+        first = (len(all_labels) == 0)
+        test_feats = []
         for x, y in test_loader:
-            feats.append(bbs[k](x.to(device)).cpu())
-            if k == 0:
+            test_feats.append(model.encode(x.to(device)).cpu())
+            if first:
                 all_labels.append(y)
-        feats = F.normalize(torch.cat(feats, 0), dim=1)
-        bbs[k].cpu()
+        first = False
+        test_feats = F.normalize(torch.cat(test_feats, 0), dim=1)
 
-        for c, proto in client_protos[k].items():
-            proto_n = F.normalize(proto.unsqueeze(0), dim=1)
-            sim = torch.mm(feats, proto_n.T).squeeze(1)
-            w = float(ccc[k].get(c, 0))
-            if w > 0:
-                scores[:, c] += sim * w
-                weights[c] += w
+        sim = torch.mm(test_feats, proto.unsqueeze(1)).squeeze(1)
+        w = float(client_class_counts[k].get(c, 0))
+        if w > 0:
+            scores[:, c] += sim * w
+            weights[c] += w
 
+        model.cpu()
         torch.cuda.empty_cache()
 
     for c in range(N_CLASSES):
         if weights[c] > 0:
             scores[:, c] /= weights[c]
-        else:
-            scores[:, c] = -float('inf')
 
     labels = torch.cat(all_labels).numpy()
     preds = scores.argmax(1).numpy()
@@ -587,10 +561,11 @@ def run_experiment(alpha, seed, gpu):
     np.random.seed(seed)
 
     print(f'\n{"=" * 70}')
-    print(f'  Pipeline I: Intrinsic Knowledge  |  α={alpha}  seed={seed}')
+    print(f'  Pipeline I-Recon: Per-class Pixel Autoencoder')
+    print(f'  α={alpha}  seed={seed}  bottleneck={BOTTLENECK}  epochs={EPOCHS}')
     print(f'{"=" * 70}')
 
-    # ── 数据分割 ──
+    # ── 数据 ──
     base_dataset = datasets.CIFAR10('./data', train=True, download=True)
     targets = np.array(base_dataset.targets)
     ci, cc = dirichlet_split(base_dataset.targets, N_CLIENTS, alpha, seed=seed)
@@ -604,154 +579,110 @@ def run_experiment(alpha, seed, gpu):
         print(f'    Client {k}: {n_cls:2d} cls, {n_smp:5d} smp  '
               f'top: {", ".join(f"c{c}={n}" for c, n in top)}')
 
+    # 按 (client, class) 分割
+    train_indices_by_class = {}
+    for k in range(N_CLIENTS):
+        for c in range(N_CLASSES):
+            cidxs = [idx for idx in ci[k] if targets[idx] == c]
+            if len(cidxs) >= MIN_SAMPLES:
+                train_indices_by_class[(k, c)] = cidxs
+
     test_ds = datasets.CIFAR10('./data', train=False, transform=get_test_transform())
     test_loader = DataLoader(test_ds, batch_size=256, shuffle=False,
                              num_workers=4, pin_memory=True)
 
-    # ── Phase 1: VICReg Backbone (纯SSL) ──
+    # ── 训练 ──
     print(f'\n{"=" * 60}')
-    print(f'  Phase 1: VICReg Backbone (纯SSL, 零标签)')
+    print(f'  Training: Per-class Pixel Autoencoders')
     print(f'{"=" * 60}')
 
-    bbs = []
+    autoencoders = {}
+    train_losses = {}
     t0 = time.time()
+
     for k in range(N_CLIENTS):
+        classes_k = sorted([c for c in range(N_CLASSES)
+                            if (k, c) in train_indices_by_class])
+        if not classes_k:
+            continue
         n_smp = sum(cc[k].values())
-        n_cls = sum(1 for v in cc[k].values() if v > 0)
-        print(f'\n  Client {k} ({n_smp} samples, {n_cls} classes):')
+        print(f'\n  Client {k} ({n_smp} samples, {len(classes_k)} classes):')
 
-        sk = seed + hash(('vicreg', alpha, k)) % 100000
-        torch.manual_seed(sk)
-        np.random.seed(sk % (2 ** 31))
-
-        bb = train_backbone_vicreg(ci[k], base_dataset, device,
-                                   epochs=EPOCHS_BB, lr=LR_BB)
-        bbs.append(bb.cpu())
-        torch.cuda.empty_cache()
-
-    t_bb = time.time() - t0
-    print(f'\n  ⏱ Backbone: {t_bb:.0f}s ({t_bb/60:.1f}min)')
-
-    # ── Phase 2: Prototypes ──
-    print(f'\n{"=" * 60}')
-    print(f'  Phase 2: Prototypes (类内均值)')
-    print(f'{"=" * 60}')
-
-    client_protos = []
-    for k in range(N_CLIENTS):
-        bbs[k].to(device)
-        protos = compute_prototypes(bbs[k], ci[k], targets, device)
-        client_protos.append(protos)
-        bbs[k].cpu()
-        torch.cuda.empty_cache()
-        print(f'  Client {k}: {len(protos)} protos '
-              f'({sorted(protos.keys())})')
-
-    # ── Phase 3: Expert Training ──
-    print(f'\n{"=" * 60}')
-    print(f'  Phase 3: Expert Training')
-    print(f'{"=" * 60}')
-
-    client_experts = []
-    t1 = time.time()
-    for k in range(N_CLIENTS):
-        bbs[k].to(device)
-        classes_k = sorted(cc[k].keys())
-        protos_k = client_protos[k]
-        print(f'\n  Client {k}: {len(classes_k)} experts')
-
-        # 按类提取特征
-        class_feats = {}
         for c in classes_k:
-            c_indices = [idx for idx in ci[k] if targets[idx] == c]
-            if len(c_indices) < 2:
-                continue
-            class_feats[c] = preextract_features(bbs[k], c_indices, device)
+            n_c = cc[k].get(c, 0)
+            # 数据量自适应
+            adj_epochs = min(EPOCHS, max(100, EPOCHS * 1000 // n_c))
+            print(f'    Class {c} (n={n_c}, epochs={adj_epochs}):')
 
-        experts_k = {}
-        for c in classes_k:
-            if c not in class_feats:
-                continue
-            # 负样本类: 当前 client 拥有 prototype 的其他类
-            other_c = [j for j in protos_k if j != c]
-            if not other_c:
-                # 只有一个类: 用全局随机方向作负样本
-                # 生成随机 prototype 替代
-                n_fake = min(3, N_CLASSES - 1)
-                fake_protos = F.normalize(torch.randn(n_fake, FEAT_DIM), dim=1)
-                for i, fp in enumerate(fake_protos):
-                    fake_c = (c + 1 + i) % N_CLASSES
-                    protos_k[fake_c] = fp
-                other_c = [fake_c for fake_c in protos_k if fake_c != c]
+            sk = seed + hash(('recon', alpha, k, c)) % 100000
+            torch.manual_seed(sk)
+            np.random.seed(sk % (2 ** 31))
 
-            t_exp = time.time()
-            expert = ConditionalExpert(FEAT_DIM, FEAT_DIM, EXPERT_HD, EXPERT_LD)
-            expert = train_expert(
-                expert, class_feats[c], protos_k[c], protos_k,
-                other_c, device, epochs=EPOCHS_EXP, lr=LR_EXP
+            model = PixelAutoencoder(BOTTLENECK)
+            model, best_loss = train_autoencoder(
+                model, train_indices_by_class[(k, c)],
+                base_dataset, device,
+                epochs=adj_epochs, lr=LR
             )
+            autoencoders[(k, c)] = model.cpu()
+            train_losses[(k, c)] = best_loss
+            torch.cuda.empty_cache()
+            print(f'        best_MSE={best_loss:.6f}')
 
-            # 训练质量检查
-            with torch.no_grad():
-                ne = min(256, class_feats[c].size(0))
-                proto_exp = protos_k[c].to(device).unsqueeze(0).expand(ne, -1)
-                fr, _ = expert.to(device)(class_feats[c][:ne], proto_exp)
-                mse = ((class_feats[c][:ne] - fr) ** 2).mean().item()
+    t_train = time.time() - t0
+    print(f'\n  ⏱ Training: {t_train:.0f}s ({t_train/60:.1f}min)')
+    print(f'  Total models: {len(autoencoders)}')
 
-            experts_k[c] = expert.cpu()
-            n_samp = cc[k].get(c, 0)
-            print(f'    c{c}: n={n_samp:5d} MSE={mse:.6f} ({time.time()-t_exp:.1f}s)')
-
-        client_experts.append(experts_k)
-        bbs[k].cpu()
-        torch.cuda.empty_cache()
-
-    t_exp_total = time.time() - t1
-    print(f'\n  ⏱ Experts: {t_exp_total:.0f}s ({t_exp_total/60:.1f}min)')
-
-    # ── Phase 4: Evaluation ──
+    # ── 评估 ──
     print(f'\n{"=" * 60}')
-    print(f'  Phase 4: Evaluation')
+    print(f'  Evaluation')
     print(f'{"=" * 60}')
 
-    # Intrinsic
-    print(f'\n  ── Intrinsic (reconstruction error) ──')
-    intrinsic_results, labels, all_errors = evaluate_intrinsic(
-        bbs, client_experts, client_protos, cc, test_loader, device
+    print(f'\n  ── Intrinsic (pixel reconstruction MSE) ──')
+    recon_results, eval_labels, all_mse = evaluate_recon(
+        autoencoders, cc, test_loader, device
     )
-    for name, acc in sorted(intrinsic_results.items(), key=lambda x: -x[1]):
+    for name, acc in sorted(recon_results.items(), key=lambda x: -x[1]):
         print(f'    {name:30s}: {acc:.2%}')
 
-    # Relational (same backbone)
-    print(f'\n  ── Relational (prototype matching, same backbone) ──')
-    rel_acc = evaluate_relational(bbs, client_protos, cc, test_loader, device)
+    per_class_analysis(all_mse, eval_labels, autoencoders, cc)
+
+    # Relational
+    print(f'\n  ── Relational (prototype matching, AE encoder) ──')
+    rel_acc = evaluate_relational(
+        autoencoders, cc, train_indices_by_class,
+        base_dataset, test_loader, device
+    )
     print(f'    prototype_matching          : {rel_acc:.2%}')
 
     # ── Summary ──
-    best_i = max(intrinsic_results.values())
-    best_i_name = max(intrinsic_results, key=intrinsic_results.get)
+    best_i = max(recon_results.values())
+    best_i_name = max(recon_results, key=recon_results.get)
 
     print(f'\n{"=" * 70}')
     print(f'  ★ RESULTS  α={alpha}  seed={seed}')
     print(f'{"=" * 70}')
     print(f'  Relational (prototype):  {rel_acc:.2%}')
-    print(f'  Intrinsic  (best):       {best_i:.2%}  ({best_i_name})')
+    print(f'  Intrinsic  (recon):      {best_i:.2%}  ({best_i_name})')
     print(f'  Gap (I - R):             {(best_i - rel_acc) * 100:+.1f} pp')
-    print(f'  Time: BB={t_bb:.0f}s  Exp={t_exp_total:.0f}s  '
-          f'Total={time.time() - t0:.0f}s')
+    print(f'  Time: {t_train:.0f}s ({t_train/60:.1f}min)')
 
-    # ── Save ──
+    # Save
     os.makedirs('results', exist_ok=True)
     out = {
         'alpha': alpha, 'seed': seed,
+        'bottleneck': BOTTLENECK,
         'relational_acc': float(rel_acc),
-        'intrinsic_results': {k: float(v) for k, v in intrinsic_results.items()},
-        'best_intrinsic': float(best_i),
-        'best_intrinsic_name': best_i_name,
+        'recon_results': {k: float(v) for k, v in recon_results.items()},
+        'best_recon': float(best_i),
+        'best_recon_name': best_i_name,
         'gap_pp': float((best_i - rel_acc) * 100),
-        'time_bb': t_bb, 'time_exp': t_exp_total,
+        'time_train': t_train,
+        'n_models': len(autoencoders),
+        'train_losses': {f'{k}_{c}': float(v)
+                         for (k, c), v in train_losses.items()},
     }
-    outpath = f'results/pipeline_I_a{alpha}_s{seed}.json'
+    outpath = f'results/pipeline_I_recon_a{alpha}_s{seed}.json'
     with open(outpath, 'w') as f:
         json.dump(out, f, indent=2)
     print(f'  Saved: {outpath}\n')
@@ -760,17 +691,20 @@ def run_experiment(alpha, seed, gpu):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument('--alpha', type=float, default=None,
-                   help='单个α值, 不指定则跑 [0.05, 0.1, 0.3, 0.5, 1.0]')
+    p.add_argument('--alpha', type=float, default=None)
     p.add_argument('--seed', type=int, default=42)
     p.add_argument('--gpu', type=int, default=0)
-    p.add_argument('--epochs_bb', type=int, default=600)
-    p.add_argument('--epochs_exp', type=int, default=600)
+    p.add_argument('--epochs', type=int, default=300)
+    p.add_argument('--bottleneck', type=int, default=128)
+    p.add_argument('--lr', type=float, default=1e-3)
+    p.add_argument('--min_samples', type=int, default=30)
     args = p.parse_args()
 
-    global EPOCHS_BB, EPOCHS_EXP
-    EPOCHS_BB = args.epochs_bb
-    EPOCHS_EXP = args.epochs_exp
+    global EPOCHS, BOTTLENECK, LR, MIN_SAMPLES
+    EPOCHS = args.epochs
+    BOTTLENECK = args.bottleneck
+    LR = args.lr
+    MIN_SAMPLES = args.min_samples
 
     if args.alpha is not None:
         run_experiment(args.alpha, args.seed, args.gpu)
@@ -783,19 +717,19 @@ def main():
         print(f'\n{"=" * 70}')
         print(f'  CROSSOVER SUMMARY')
         print(f'{"=" * 70}')
-        print(f'  {"α":>6s} | {"Relational":>12s} | {"Intrinsic":>12s} | '
-              f'{"Gap":>10s} | Winner')
-        print(f'  {"-" * 6} | {"-" * 12} | {"-" * 12} | '
-              f'{"-" * 10} | ------')
+        print(f'  {"α":>6s} | {"Relational":>10s} | {"Recon":>8s} | '
+              f'{"Gap":>8s} | Winner')
+        print(f'  {"-"*6} | {"-"*10} | {"-"*8} | '
+              f'{"-"*8} | ------')
         for r in all_results:
             rel = r['relational_acc']
-            intr = r['best_intrinsic']
+            rec = r['best_recon']
             gap = r['gap_pp']
             w = 'Intrinsic ★' if gap > 0 else 'Relational'
-            print(f'  {r["alpha"]:6.2f} | {rel:>11.2%} | {intr:>11.2%} | '
-                  f'{gap:>+9.1f}pp | {w}')
+            print(f'  {r["alpha"]:6.2f} | {rel:>9.2%} | '
+                  f'{rec:>7.2%} | {gap:>+7.1f}pp | {w}')
 
-        outpath = f'results/pipeline_I_summary_s{args.seed}.json'
+        outpath = f'results/pipeline_I_recon_summary_s{args.seed}.json'
         with open(outpath, 'w') as f:
             json.dump(all_results, f, indent=2)
         print(f'\n  Summary: {outpath}')
