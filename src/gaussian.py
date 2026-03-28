@@ -18,26 +18,39 @@ from torchvision import datasets, transforms
 
 warnings.filterwarnings("ignore")
 
+
 # ============================================================
 # Config
 # ============================================================
 N_CLIENTS   = 5
 N_CLASSES   = 10
+
 BATCH_SIZE  = 256
 LR          = 1e-3
 WD          = 1e-4
 EPOCHS      = 300
+
 FEAT_DIM    = 256
 PROJ_DIM    = 256
 MIN_SAMPLES = 30
 
-# class-conditional VICReg style weights
+# VICReg-style weights
 LAMBDA_INV  = 25.0
 MU_VAR      = 25.0
 NU_COV      = 1.0
 
+# dual-positive weights
+W_INST_Z    = 1.0   # instance pair on projector output
+W_CLASS_Z   = 1.0   # class pair on projector output
+W_INST_F    = 0.5   # instance pair on backbone feature
+W_CLASS_F   = 0.5   # class pair on backbone feature
+
 # Gaussian intrinsic
 EPS_VAR     = 1e-4
+
+# checkpoint selection
+CKPT_SCORE_W_ACTIVE = 1.0
+CKPT_SCORE_W_STD    = 50.0   # feat_std is small, scale it up in score
 
 CIFAR_MEAN = (0.4914, 0.4822, 0.4465)
 CIFAR_STD  = (0.2470, 0.2435, 0.2616)
@@ -63,7 +76,7 @@ def dirichlet_split(targets, n_clients, alpha, seed=42):
     rng = np.random.RandomState(seed)
     class_indices = defaultdict(list)
     for idx, label in enumerate(targets):
-        class_indices[label].append(idx)
+        class_indices[int(label)].append(idx)
 
     client_indices = defaultdict(list)
     client_class_counts = defaultdict(lambda: defaultdict(int))
@@ -92,7 +105,6 @@ def dirichlet_split(targets, n_clients, alpha, seed=42):
 # Data
 # ============================================================
 def get_ssl_transform():
-    # 不加大角度旋转，不加类间分离
     return transforms.Compose([
         transforms.RandomResizedCrop(32, scale=(0.6, 1.0)),
         transforms.RandomHorizontalFlip(p=0.5),
@@ -110,63 +122,75 @@ def get_test_transform():
     ])
 
 
-class ClientClassPairDataset(Dataset):
+class ClientDualPositiveDataset(Dataset):
     """
-    对 client k 的本地数据，按“同类样本对”采样：
-      x1, x2 来自同一个 class
-    这样 backbone 学的是类内一致性，不引入类间分离。
+    每个样本返回：
+      1) instance-level positive:
+         同一张图像的两个增强视图
+      2) class-level positive:
+         同类不同样本的两个增强视图
+
+    不引入类间分离，不按客户端结构切换训练方式。
     """
-    def __init__(self, base_dataset, indices, min_samples=2):
+    def __init__(self, base_dataset, indices, min_class_samples_for_pair=2):
         self.data = base_dataset.data
         self.targets = np.array(base_dataset.targets)
         self.transform = get_ssl_transform()
 
+        self.indices = list(indices)
+        self.length = max(len(self.indices), 1)
+
         by_class = defaultdict(list)
-        for idx in indices:
+        for idx in self.indices:
             c = int(self.targets[idx])
             by_class[c].append(idx)
 
-        # 只保留至少有 2 个样本的类
-        self.by_class = {c: idxs for c, idxs in by_class.items() if len(idxs) >= min_samples}
-        self.classes = sorted(self.by_class.keys())
+        self.by_class = dict(by_class)
+        self.classes_all = sorted(self.by_class.keys())
+        self.classes_pairable = sorted([c for c, idxs in self.by_class.items()
+                                        if len(idxs) >= min_class_samples_for_pair])
 
-        # 为了让 epoch 有足够步数，长度设为本地样本数
-        self.length = max(len(indices), 1)
+        counts_all = np.array([len(self.by_class[c]) for c in self.classes_all], dtype=np.float64)
+        self.class_probs_all = counts_all / counts_all.sum() if len(counts_all) > 0 else None
 
-        # 按类样本数做采样概率，谁的样本多，被采到的机会更高
-        counts = np.array([len(self.by_class[c]) for c in self.classes], dtype=np.float64)
-        self.class_probs = counts / counts.sum() if len(counts) > 0 else None
+        counts_pair = np.array([len(self.by_class[c]) for c in self.classes_pairable], dtype=np.float64)
+        self.class_probs_pair = counts_pair / counts_pair.sum() if len(counts_pair) > 0 else None
 
     def __len__(self):
         return self.length
 
     def __getitem__(self, idx):
-        if len(self.classes) == 0:
-            raise RuntimeError("No valid class with >=2 samples for pair sampling.")
+        # ---------- instance positive ----------
+        idx_inst = random.choice(self.indices)
+        img_inst = Image.fromarray(self.data[idx_inst])
+        xi1 = self.transform(img_inst)
+        xi2 = self.transform(img_inst)
+        yi = int(self.targets[idx_inst])
 
-        c = int(np.random.choice(self.classes, p=self.class_probs))
-        idxs = self.by_class[c]
-
-        # 尽量取两个不同样本
-        if len(idxs) >= 2:
-            i1, i2 = np.random.choice(idxs, size=2, replace=False)
+        # ---------- class positive ----------
+        if len(self.classes_pairable) > 0:
+            c = int(np.random.choice(self.classes_pairable, p=self.class_probs_pair))
+            idxs = self.by_class[c]
+            j1, j2 = np.random.choice(idxs, size=2, replace=False)
         else:
-            i1 = i2 = idxs[0]
+            # 极端兜底：如果没有可配对的类，就退化成同一样本双视图
+            c = int(np.random.choice(self.classes_all, p=self.class_probs_all))
+            idxs = self.by_class[c]
+            j1 = j2 = random.choice(idxs)
 
-        img1 = Image.fromarray(self.data[i1])
-        img2 = Image.fromarray(self.data[i2])
+        img_c1 = Image.fromarray(self.data[j1])
+        img_c2 = Image.fromarray(self.data[j2])
+        xc1 = self.transform(img_c1)
+        xc2 = self.transform(img_c2)
 
-        x1 = self.transform(img1)
-        x2 = self.transform(img2)
-        return x1, x2, c
+        return xi1, xi2, xc1, xc2, yi, c
 
 
 class IndexedClassDataset(Dataset):
-    """用于提 feature / 拟合高斯"""
     def __init__(self, base_dataset, indices, transform):
         self.data = base_dataset.data
         self.targets = np.array(base_dataset.targets)
-        self.indices = indices
+        self.indices = list(indices)
         self.transform = transform
 
     def __len__(self):
@@ -185,16 +209,18 @@ class IndexedClassDataset(Dataset):
 class GNBasicBlock(nn.Module):
     def __init__(self, in_ch, out_ch, stride=1):
         super().__init__()
+        g1 = 8 if out_ch >= 8 else 1
         self.conv1 = nn.Conv2d(in_ch, out_ch, 3, stride=stride, padding=1, bias=False)
-        self.gn1   = nn.GroupNorm(8 if out_ch >= 8 else 1, out_ch)
+        self.gn1 = nn.GroupNorm(g1, out_ch)
+
         self.conv2 = nn.Conv2d(out_ch, out_ch, 3, stride=1, padding=1, bias=False)
-        self.gn2   = nn.GroupNorm(8 if out_ch >= 8 else 1, out_ch)
+        self.gn2 = nn.GroupNorm(g1, out_ch)
 
         self.shortcut = nn.Identity()
         if stride != 1 or in_ch != out_ch:
             self.shortcut = nn.Sequential(
                 nn.Conv2d(in_ch, out_ch, 1, stride=stride, bias=False),
-                nn.GroupNorm(8 if out_ch >= 8 else 1, out_ch)
+                nn.GroupNorm(g1, out_ch)
             )
 
     def forward(self, x):
@@ -229,7 +255,7 @@ class SmallBackbone(nn.Module):
             GNBasicBlock(512, 512, 1),
         )
         self.pool = nn.AdaptiveAvgPool2d(1)
-        self.fc   = nn.Linear(512, feat_dim)
+        self.fc = nn.Linear(512, feat_dim)
 
     def forward(self, x):
         x = self.stem(x)
@@ -273,7 +299,7 @@ class ClientBackboneModel(nn.Module):
 
 
 # ============================================================
-# Loss: class-conditional VICReg
+# Loss
 # ============================================================
 def vicreg_like_loss(z1, z2, gamma=1.0,
                      lambda_inv=LAMBDA_INV,
@@ -295,26 +321,98 @@ def vicreg_like_loss(z1, z2, gamma=1.0,
     cov_loss = off_diagonal(cov_z1).pow(2).mean() + off_diagonal(cov_z2).pow(2).mean()
 
     loss = lambda_inv * inv_loss + mu_var * var_loss + nu_cov * cov_loss
-    return loss, {
+    parts = {
         "inv": float(inv_loss.item()),
         "var": float(var_loss.item()),
         "cov": float(cov_loss.item()),
     }
+    return loss, parts
+
+
+def dual_positive_loss(fi1, fi2, zi1, zi2,
+                       fc1, fc2, zc1, zc2):
+    # instance pair loss on projector output
+    loss_inst_z, parts_inst_z = vicreg_like_loss(zi1, zi2)
+    # class pair loss on projector output
+    loss_class_z, parts_class_z = vicreg_like_loss(zc1, zc2)
+
+    # backbone feature also regularized
+    loss_inst_f, parts_inst_f = vicreg_like_loss(fi1, fi2)
+    loss_class_f, parts_class_f = vicreg_like_loss(fc1, fc2)
+
+    total = (
+        W_INST_Z  * loss_inst_z +
+        W_CLASS_Z * loss_class_z +
+        W_INST_F  * loss_inst_f +
+        W_CLASS_F * loss_class_f
+    )
+
+    logs = {
+        "loss_inst_z": float(loss_inst_z.item()),
+        "loss_class_z": float(loss_class_z.item()),
+        "loss_inst_f": float(loss_inst_f.item()),
+        "loss_class_f": float(loss_class_f.item()),
+
+        "inst_z_inv": parts_inst_z["inv"],
+        "inst_z_var": parts_inst_z["var"],
+        "inst_z_cov": parts_inst_z["cov"],
+
+        "class_z_inv": parts_class_z["inv"],
+        "class_z_var": parts_class_z["var"],
+        "class_z_cov": parts_class_z["cov"],
+
+        "inst_f_inv": parts_inst_f["inv"],
+        "inst_f_var": parts_inst_f["var"],
+        "inst_f_cov": parts_inst_f["cov"],
+
+        "class_f_inv": parts_class_f["inv"],
+        "class_f_var": parts_class_f["var"],
+        "class_f_cov": parts_class_f["cov"],
+    }
+    return total, logs
 
 
 # ============================================================
-# Train local backbone
+# Training
 # ============================================================
+@torch.no_grad()
+def probe_feature_quality(model, loader, device, n_batches=1):
+    model.eval()
+    feat_list = []
+
+    it = iter(loader)
+    for _ in range(n_batches):
+        try:
+            batch = next(it)
+        except StopIteration:
+            break
+
+        xi1, _, _, _, _, _ = batch
+        xi1 = xi1.to(device, non_blocking=True)
+        f = model.encode(xi1)
+        feat_list.append(f.detach().cpu())
+
+    if len(feat_list) == 0:
+        return 0.0, 0.0
+
+    feats = torch.cat(feat_list, dim=0)
+    feat_std = feats.std(dim=0).mean().item()
+    active_ratio = (feats.std(dim=0) > 0.01).float().mean().item()
+    return feat_std, active_ratio
+
+
 def train_client_backbone(client_id, base_dataset, client_indices, device,
                           epochs=EPOCHS, lr=LR, wd=WD):
-    dataset = ClientClassPairDataset(base_dataset, client_indices, min_samples=2)
+    dataset = ClientDualPositiveDataset(base_dataset, client_indices, min_class_samples_for_pair=2)
+    drop_last = len(dataset) >= BATCH_SIZE
+
     loader = DataLoader(
         dataset,
         batch_size=BATCH_SIZE,
         shuffle=True,
         num_workers=4,
         pin_memory=True,
-        drop_last=len(dataset) >= BATCH_SIZE,
+        drop_last=drop_last,
         persistent_workers=True
     )
 
@@ -323,60 +421,67 @@ def train_client_backbone(client_id, base_dataset, client_indices, device,
     sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
 
     use_bf16 = torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8
-    best_loss = float("inf")
+
     best_state = None
+    best_score = -1e18
+    best_epoch = 0
 
     print(f"\n  Client {client_id}: backbone training on {len(client_indices)} samples")
 
     for ep in range(epochs):
         model.train()
-        loss_sum = 0.0
-        inv_sum = 0.0
-        var_sum = 0.0
-        cov_sum = 0.0
-        n_batch = 0
 
-        for x1, x2, _ in loader:
-            x1 = x1.to(device, non_blocking=True)
-            x2 = x2.to(device, non_blocking=True)
+        loss_sum = 0.0
+        count = 0
+
+        acc_logs = defaultdict(float)
+
+        for xi1, xi2, xc1, xc2, _, _ in loader:
+            xi1 = xi1.to(device, non_blocking=True)
+            xi2 = xi2.to(device, non_blocking=True)
+            xc1 = xc1.to(device, non_blocking=True)
+            xc2 = xc2.to(device, non_blocking=True)
 
             with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=use_bf16):
-                _, z1 = model.project(x1)
-                _, z2 = model.project(x2)
-                loss, parts = vicreg_like_loss(z1, z2)
+                fi1, zi1 = model.project(xi1)
+                fi2, zi2 = model.project(xi2)
+                fc1, zc1 = model.project(xc1)
+                fc2, zc2 = model.project(xc2)
+
+                loss, logs = dual_positive_loss(fi1, fi2, zi1, zi2, fc1, fc2, zc1, zc2)
 
             opt.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
             opt.step()
 
-            loss_sum += loss.item()
-            inv_sum += parts["inv"]
-            var_sum += parts["var"]
-            cov_sum += parts["cov"]
-            n_batch += 1
+            loss_sum += float(loss.item())
+            count += 1
+            for k, v in logs.items():
+                acc_logs[k] += float(v)
 
         sch.step()
-        avg_loss = loss_sum / max(n_batch, 1)
 
-        if avg_loss < best_loss:
-            best_loss = avg_loss
+        avg_loss = loss_sum / max(count, 1)
+        avg_logs = {k: v / max(count, 1) for k, v in acc_logs.items()}
+
+        feat_std, active_ratio = probe_feature_quality(model, loader, device, n_batches=1)
+
+        # checkpoint selection: not by training loss, by feature quality
+        ckpt_score = CKPT_SCORE_W_ACTIVE * active_ratio + CKPT_SCORE_W_STD * feat_std
+        if ckpt_score > best_score:
+            best_score = ckpt_score
+            best_epoch = ep + 1
             best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
 
         if (ep + 1) % 50 == 0 or ep == 0:
-            model.eval()
-            with torch.no_grad():
-                x1, _, _ = next(iter(loader))
-                feats = model.encode(x1[:min(128, len(x1))].to(device))
-                feat_std = feats.std(dim=0).mean().item()
-                active_ratio = (feats.std(dim=0) > 0.01).float().mean().item()
-
             print(
                 f"    ep {ep+1:3d}/{epochs}  "
                 f"loss={avg_loss:.4f}  "
-                f"inv={inv_sum/max(n_batch,1):.4f}  "
-                f"var={var_sum/max(n_batch,1):.4f}  "
-                f"cov={cov_sum/max(n_batch,1):.4f}  "
+                f"inst_z={avg_logs['loss_inst_z']:.4f}  "
+                f"class_z={avg_logs['loss_class_z']:.4f}  "
+                f"inst_f={avg_logs['loss_inst_f']:.4f}  "
+                f"class_f={avg_logs['loss_class_f']:.4f}  "
                 f"feat_std={feat_std:.4f}  active={active_ratio:.1%}"
             )
 
@@ -385,36 +490,46 @@ def train_client_backbone(client_id, base_dataset, client_indices, device,
 
     model.eval()
     model = model.cpu()
-    return model, best_loss
+
+    meta = {
+        "best_epoch": best_epoch,
+        "best_score": best_score,
+    }
+    return model, meta
 
 
 # ============================================================
 # Fit local Gaussian intrinsic models
 # ============================================================
 @torch.no_grad()
-def extract_features(backbone, loader, device):
-    backbone = backbone.to(device).eval()
+def extract_features(backbone_model, loader, device):
+    backbone_model = backbone_model.to(device).eval()
     feats = []
     labels = []
+
     for x, y in loader:
         x = x.to(device, non_blocking=True)
-        f = backbone.encode(x).cpu()
+        f = backbone_model.encode(x).cpu()
         feats.append(f)
         labels.append(y)
-    backbone = backbone.cpu()
+
+    backbone_model = backbone_model.cpu()
     return torch.cat(feats, dim=0), torch.cat(labels, dim=0)
 
 
 @torch.no_grad()
-def fit_client_intrinsic_models(client_id, backbone, base_dataset, client_indices,
+def fit_client_intrinsic_models(client_id, backbone_model, base_dataset, client_indices,
                                 client_class_counts, device, min_samples=MIN_SAMPLES):
     ds = IndexedClassDataset(base_dataset, client_indices, transform=get_test_transform())
     loader = DataLoader(
-        ds, batch_size=256, shuffle=False,
-        num_workers=4, pin_memory=True
+        ds,
+        batch_size=256,
+        shuffle=False,
+        num_workers=4,
+        pin_memory=True
     )
 
-    feats, labels = extract_features(backbone, loader, device)
+    feats, labels = extract_features(backbone_model, loader, device)
 
     models = {}
     for c in sorted(client_class_counts[client_id].keys()):
@@ -423,14 +538,13 @@ def fit_client_intrinsic_models(client_id, backbone, base_dataset, client_indice
             continue
 
         mask = (labels == c)
-        fc = feats[mask]  # [Nc, D]
+        fc = feats[mask]
         if len(fc) < min_samples:
             continue
 
         mu = fc.mean(dim=0)
         var = fc.var(dim=0, unbiased=False).clamp(min=EPS_VAR)
 
-        # calibration: 训练集本类 energy 分布
         energy = ((fc - mu) ** 2 / var).sum(dim=1)
         e_mean = energy.mean()
         e_std = energy.std(unbiased=False).clamp(min=1e-6)
@@ -455,17 +569,14 @@ def fit_client_intrinsic_models(client_id, backbone, base_dataset, client_indice
 # ============================================================
 @torch.no_grad()
 def evaluate_intrinsic(backbones, intrinsic_models, client_class_counts, test_loader, device):
-    all_labels = []
-    n_test = 10000
+    all_labels = None
+    n_test = len(test_loader.dataset)
 
-    # 存标准化 score，越大越好
-    all_scores = torch.zeros(N_CLIENTS, n_test, N_CLASSES)
-    all_scores[:] = float("-inf")
+    all_scores = torch.full((N_CLIENTS, n_test, N_CLASSES), float("-inf"))
 
     for k in range(N_CLIENTS):
         backbone = backbones[k].to(device).eval()
 
-        # 先提该 client 对所有测试集的 feature
         feats = []
         labels = []
         for x, y in test_loader:
@@ -475,7 +586,7 @@ def evaluate_intrinsic(backbones, intrinsic_models, client_class_counts, test_lo
             if k == 0:
                 labels.append(y)
 
-        feats = torch.cat(feats, dim=0)  # [N, D]
+        feats = torch.cat(feats, dim=0)
         if k == 0:
             all_labels = torch.cat(labels).numpy()
 
@@ -486,20 +597,20 @@ def evaluate_intrinsic(backbones, intrinsic_models, client_class_counts, test_lo
             e_std = pack["e_std"]
 
             energy = ((feats - mu) ** 2 / var).sum(dim=1)
-            z = (energy - e_mean) / e_std  # 越小越像本类
-            score = -z                      # 越大越像本类
+            z = (energy - e_mean) / e_std
+            score = -z
             all_scores[k, :, c] = score
 
         backbones[k] = backbone.cpu()
 
     results = {}
 
-    # S1: 简单 max over clients then argmax over classes
-    best_per_class, _ = all_scores.max(dim=0)  # [N, C]
+    # S1: max over clients
+    best_per_class, _ = all_scores.max(dim=0)
     preds = best_per_class.argmax(dim=1).numpy()
-    results["S1_max_score"] = (preds == all_labels).mean()
+    results["S1_max_score"] = float((preds == all_labels).mean())
 
-    # S2: 按 log(n+1) 加权聚合
+    # S2: weighted by log(n+1)
     weighted = torch.zeros(n_test, N_CLASSES)
     denom = torch.zeros(N_CLASSES)
 
@@ -516,9 +627,9 @@ def evaluate_intrinsic(backbones, intrinsic_models, client_class_counts, test_lo
             weighted[:, c] /= denom[c]
 
     preds_w = weighted.argmax(dim=1).numpy()
-    results["S2_weighted_logN"] = (preds_w == all_labels).mean()
+    results["S2_weighted_logN"] = float((preds_w == all_labels).mean())
 
-    # S3: 只用每类样本量最大的 client expert
+    # S3: top expert per class
     top = torch.full((n_test, N_CLASSES), float("-inf"))
     for c in range(N_CLASSES):
         best_k = -1
@@ -533,7 +644,7 @@ def evaluate_intrinsic(backbones, intrinsic_models, client_class_counts, test_lo
             top[:, c] = all_scores[best_k, :, c]
 
     preds_top = top.argmax(dim=1).numpy()
-    results["S3_top_expert"] = (preds_top == all_labels).mean()
+    results["S3_top_expert"] = float((preds_top == all_labels).mean())
 
     return results
 
@@ -546,7 +657,7 @@ def run_experiment(alpha, seed, gpu):
     device = torch.device(f"cuda:{gpu}" if torch.cuda.is_available() else "cpu")
 
     print(f"\n{'='*72}")
-    print(f"  Pipeline Intrinsic-CCVICReg-Gaussian")
+    print(f"  Pipeline Intrinsic-DualPos-Gaussian")
     print(f"  alpha={alpha}  seed={seed}  epochs={EPOCHS}")
     print(f"{'='*72}")
 
@@ -579,19 +690,19 @@ def run_experiment(alpha, seed, gpu):
     print(f"{'='*60}")
 
     backbones = {}
-    bb_losses = {}
+    bb_meta = {}
     t0 = time.time()
 
     for k in range(N_CLIENTS):
         idxs = client_indices[k]
         if len(idxs) < 2:
             continue
-        model, best_loss = train_client_backbone(
+        model, meta = train_client_backbone(
             k, train_base, idxs, device,
             epochs=EPOCHS, lr=LR, wd=WD
         )
         backbones[k] = model
-        bb_losses[k] = best_loss
+        bb_meta[k] = meta
         torch.cuda.empty_cache()
 
     t_bb = time.time() - t0
@@ -639,13 +750,22 @@ def run_experiment(alpha, seed, gpu):
         "feat_dim": FEAT_DIM,
         "proj_dim": PROJ_DIM,
         "min_samples": MIN_SAMPLES,
-        "bb_losses": {str(k): float(v) for k, v in bb_losses.items()},
+        "weights": {
+            "W_INST_Z": W_INST_Z,
+            "W_CLASS_Z": W_CLASS_Z,
+            "W_INST_F": W_INST_F,
+            "W_CLASS_F": W_CLASS_F,
+            "LAMBDA_INV": LAMBDA_INV,
+            "MU_VAR": MU_VAR,
+            "NU_COV": NU_COV,
+        },
+        "bb_meta": {str(k): v for k, v in bb_meta.items()},
         "results": {k: float(v) for k, v in results.items()},
         "best_name": best_name,
         "best_acc": float(best_acc),
         "time_backbone": t_bb,
     }
-    outpath = f"results/pipeline_intrinsic_ccvicreg_gaussian_a{alpha}_s{seed}.json"
+    outpath = f"results/pipeline_intrinsic_dualpos_gaussian_a{alpha}_s{seed}.json"
     with open(outpath, "w") as f:
         json.dump(out, f, indent=2)
 
@@ -662,12 +782,15 @@ def main():
     parser.add_argument("--alpha", type=float, default=0.05)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--gpu", type=int, default=0)
+
     parser.add_argument("--epochs", type=int, default=300)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--wd", type=float, default=1e-4)
+
     parser.add_argument("--feat_dim", type=int, default=256)
     parser.add_argument("--proj_dim", type=int, default=256)
     parser.add_argument("--min_samples", type=int, default=30)
+
     args = parser.parse_args()
 
     global EPOCHS, LR, WD, FEAT_DIM, PROJ_DIM, MIN_SAMPLES
@@ -683,12 +806,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
-"""
-
-  Intrinsic results:
-    S2_weighted_logN        : 35.86%
-    S3_top_expert           : 30.31%
-    S1_max_score            : 28.21%
-
-"""
