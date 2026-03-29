@@ -33,14 +33,19 @@ FEAT_DIM = 256
 MIN_SAMPLES = 30
 CALIB_RATIO = 0.10
 
-# LMPRE config
+# Local manifold expert config
 N_PROTOS = 4
 TAU = 0.10
-LAMBDA_INST = 1.0
-LAMBDA_PROTO = 1.0
-LAMBDA_REC = 0.5
-LAMBDA_SPREAD = 0.1
 SPREAD_MARGIN = 0.5
+
+# Loss weights
+LAMBDA_INST = 1.0
+LAMBDA_VAR = 25.0
+LAMBDA_COV = 1.0
+LAMBDA_PROTO = 1.0
+LAMBDA_REC = 0.25
+LAMBDA_SPREAD = 0.1
+VAR_TARGET = 0.6
 
 EPS = 1e-8
 MAX_RELIABILITY = 6.0
@@ -120,7 +125,7 @@ def split_client_train_calib(base_targets, indices, calib_ratio=0.1, seed=42):
 # ============================================================
 def get_ssl_transform():
     return transforms.Compose([
-        transforms.RandomResizedCrop(32, scale=(0.6, 1.0)),
+        transforms.RandomResizedCrop(32, scale=(0.5, 1.0)),
         transforms.RandomHorizontalFlip(p=0.5),
         transforms.ColorJitter(0.4, 0.4, 0.4, 0.1),
         transforms.RandomGrayscale(p=0.2),
@@ -140,10 +145,6 @@ def get_test_transform():
 # Datasets
 # ============================================================
 class ClientClassSSLPairDataset(Dataset):
-    """
-    Return two augmentations of the same sample and its class label.
-    Used for client-local class-conditional manifold learning.
-    """
     def __init__(self, base_dataset, indices):
         self.data = base_dataset.data
         self.targets = np.array(base_dataset.targets)
@@ -233,6 +234,7 @@ class SmallBackbone(nn.Module):
         )
         self.pool = nn.AdaptiveAvgPool2d(1)
         self.fc = nn.Linear(512, feat_dim)
+        self.bn = nn.BatchNorm1d(feat_dim, affine=False)
 
     def forward(self, x):
         x = self.stem(x)
@@ -242,6 +244,7 @@ class SmallBackbone(nn.Module):
         x = self.layer4(x)
         x = self.pool(x).flatten(1)
         x = self.fc(x)
+        x = self.bn(x)
         x = F.normalize(x, dim=1)
         return x
 
@@ -266,7 +269,7 @@ class ClassExpert(nn.Module):
         return z_bar, z_tilde, w, p, sim
 
 
-class ClientLMPREModel(nn.Module):
+class ClientLMUEModel(nn.Module):
     def __init__(self, feat_dim=256, n_classes=10, n_proto=4):
         super().__init__()
         self.backbone = SmallBackbone(feat_dim=feat_dim)
@@ -282,7 +285,7 @@ class ClientLMPREModel(nn.Module):
 
 
 # ============================================================
-# Loss
+# Losses
 # ============================================================
 def spread_loss(prototypes, margin=0.5):
     p = F.normalize(prototypes, dim=1)
@@ -294,13 +297,35 @@ def spread_loss(prototypes, margin=0.5):
     return F.relu(vals - margin).mean()
 
 
+def variance_loss(z, target_std=1.0, eps=1e-4):
+    if z.shape[0] < 2:
+        return torch.tensor(0.0, device=z.device)
+    std = torch.sqrt(z.var(dim=0, unbiased=False) + eps)
+    return F.relu(target_std - std).mean()
+
+
+def covariance_loss(z):
+    if z.shape[0] < 2:
+        return torch.tensor(0.0, device=z.device)
+    z = z - z.mean(dim=0, keepdim=True)
+    cov = (z.T @ z) / max(z.shape[0] - 1, 1)
+    off_diag = cov - torch.diag(torch.diag(cov))
+    return (off_diag ** 2).sum() / z.shape[1]
+
+
+def active_ratio(z, threshold=0.01):
+    if z.shape[0] < 2:
+        return 0.0
+    return float((z.std(dim=0, unbiased=False) > threshold).float().mean().item())
+
+
 # ============================================================
-# Train Client LMPRE
+# Train Client LMUE
 # ============================================================
-def train_client_lmpre(client_id, base_dataset, client_indices, device,
-                       epochs=EPOCHS, lr=LR, wd=WD,
-                       feat_dim=FEAT_DIM, n_proto=N_PROTOS):
-    dataset = ClientClassSSLPairDataset(base_dataset, client_indices)
+def train_client_lmue(client_id, base_dataset, client_indices, device,
+                      epochs=EPOCHS, lr=LR, wd=WD,
+                      feat_dim=FEAT_DIM, n_proto=N_PROTOS):
+    dataset = ClientClassSSLPairDataset(base_dataset, indices=client_indices)
     loader = DataLoader(
         dataset,
         batch_size=BATCH_SIZE,
@@ -311,7 +336,7 @@ def train_client_lmpre(client_id, base_dataset, client_indices, device,
         persistent_workers=True,
     )
 
-    model = ClientLMPREModel(feat_dim=feat_dim, n_classes=N_CLASSES, n_proto=n_proto).to(device)
+    model = ClientLMUEModel(feat_dim=feat_dim, n_classes=N_CLASSES, n_proto=n_proto).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=wd)
     sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
 
@@ -320,7 +345,7 @@ def train_client_lmpre(client_id, base_dataset, client_indices, device,
     best_state = None
     best_quality = -1e9
 
-    print(f"\n  Client {client_id}: LMPRE training on {len(client_indices)} samples")
+    print(f"\n  Client {client_id}: LMUE training on {len(client_indices)} samples")
 
     for ep in range(epochs):
         model.train()
@@ -336,9 +361,12 @@ def train_client_lmpre(client_id, base_dataset, client_indices, device,
             with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=use_bf16):
                 z1 = model.encode(x1)
                 z2 = model.encode(x2)
+                z_pair = torch.cat([z1, z2], dim=0)
+                y_pair = torch.cat([y, y], dim=0)
 
                 loss_inst = F.mse_loss(z1, z2)
-
+                loss_var = torch.tensor(0.0, device=device)
+                loss_cov = torch.tensor(0.0, device=device)
                 loss_proto = torch.tensor(0.0, device=device)
                 loss_rec = torch.tensor(0.0, device=device)
                 loss_spread = torch.tensor(0.0, device=device)
@@ -346,28 +374,31 @@ def train_client_lmpre(client_id, base_dataset, client_indices, device,
 
                 unique_classes = y.unique(sorted=True)
                 for cls_id in unique_classes.tolist():
-                    mask = (y == cls_id)
-                    if int(mask.sum().item()) == 0:
+                    mask_pair = (y_pair == cls_id)
+                    zc = z_pair[mask_pair]
+                    if zc.shape[0] < 2:
                         continue
 
-                    z1c = z1[mask]
-                    z2c = z2[mask]
+                    zbar, ztilde, _, p, _ = model.expert_forward(zc, cls_id, tau=TAU)
 
-                    zbar1, ztilde1, _, p, _ = model.expert_forward(z1c, cls_id, tau=TAU)
-                    zbar2, ztilde2, _, _, _ = model.expert_forward(z2c, cls_id, tau=TAU)
-
-                    loss_proto = loss_proto + F.mse_loss(z1c, zbar1) + F.mse_loss(z2c, zbar2)
-                    loss_rec = loss_rec + F.mse_loss(z1c, ztilde1) + F.mse_loss(z2c, ztilde2)
+                    loss_var = loss_var + variance_loss(zc, target_std=VAR_TARGET)
+                    loss_cov = loss_cov + covariance_loss(zc)
+                    loss_proto = loss_proto + F.mse_loss(zc, zbar)
+                    loss_rec = loss_rec + F.mse_loss(zc, ztilde)
                     loss_spread = loss_spread + spread_loss(p, margin=SPREAD_MARGIN)
                     n_groups += 1
 
                 if n_groups > 0:
+                    loss_var = loss_var / n_groups
+                    loss_cov = loss_cov / n_groups
                     loss_proto = loss_proto / n_groups
                     loss_rec = loss_rec / n_groups
                     loss_spread = loss_spread / n_groups
 
                 loss = (
                     LAMBDA_INST * loss_inst
+                    + LAMBDA_VAR * loss_var
+                    + LAMBDA_COV * loss_cov
                     + LAMBDA_PROTO * loss_proto
                     + LAMBDA_REC * loss_rec
                     + LAMBDA_SPREAD * loss_spread
@@ -380,6 +411,8 @@ def train_client_lmpre(client_id, base_dataset, client_indices, device,
 
             loss_sum += float(loss.item())
             stat_sum["inst"] += float(loss_inst.item())
+            stat_sum["var"] += float(loss_var.item())
+            stat_sum["cov"] += float(loss_cov.item())
             stat_sum["proto"] += float(loss_proto.item())
             stat_sum["rec"] += float(loss_rec.item())
             stat_sum["spread"] += float(loss_spread.item())
@@ -394,9 +427,9 @@ def train_client_lmpre(client_id, base_dataset, client_indices, device,
             batch = next(iter(loader))
             x_probe = batch[0][:min(128, len(batch[0]))].to(device)
             feats = model.encode(x_probe)
-            feat_std = feats.std(dim=0).mean().item()
-            active_ratio = (feats.std(dim=0) > 0.01).float().mean().item()
-            quality_score = active_ratio + 10.0 * feat_std - 0.01 * avg_loss
+            feat_std = feats.std(dim=0, unbiased=False).mean().item()
+            act_ratio = active_ratio(feats)
+            quality_score = 2.0 * act_ratio + 10.0 * feat_std - 0.01 * avg_loss
 
         if quality_score > best_quality:
             best_quality = quality_score
@@ -409,10 +442,12 @@ def train_client_lmpre(client_id, base_dataset, client_indices, device,
                 f"    ep {ep+1:3d}/{epochs}  "
                 f"loss={avg_loss:.4f}  "
                 f"inst={avg('inst'):.4f}  "
+                f"var={avg('var'):.4f}  "
+                f"cov={avg('cov'):.4f}  "
                 f"proto={avg('proto'):.4f}  "
                 f"rec={avg('rec'):.4f}  "
                 f"spread={avg('spread'):.4f}  "
-                f"feat_std={feat_std:.4f}  active={active_ratio:.1%}"
+                f"feat_std={feat_std:.4f}  active={act_ratio:.1%}"
             )
 
     if best_state is not None:
@@ -440,13 +475,13 @@ def extract_features(model, loader, device):
 
 
 # ============================================================
-# Fit LMPRE Intrinsic Models + Calibration
+# Fit intrinsic models + calibration
 # ============================================================
 @torch.no_grad()
-def fit_client_lmpre_models(client_id, model, base_dataset,
-                            fit_indices, calib_indices,
-                            client_class_counts_fit, device,
-                            min_samples=MIN_SAMPLES):
+def fit_client_lmue_models(client_id, model, base_dataset,
+                           fit_indices, calib_indices,
+                           client_class_counts_fit, device,
+                           min_samples=MIN_SAMPLES):
     fit_ds = IndexedClassDataset(base_dataset, fit_indices, transform=get_test_transform())
     fit_loader = DataLoader(fit_ds, batch_size=256, shuffle=False, num_workers=4, pin_memory=True)
     fit_feats, fit_labels = extract_features(model, fit_loader, device)
@@ -474,7 +509,6 @@ def fit_client_lmpre_models(client_id, model, base_dataset,
         expert = model.experts[c]
         p = F.normalize(expert.prototypes.detach().cpu(), dim=1)
 
-        # fit-set score statistics
         z = fc.to(device)
         zbar, ztilde, _, _, sim = expert(z, tau=TAU)
         s_cos = sim.max(dim=1).values
@@ -560,7 +594,7 @@ def fit_client_lmpre_models(client_id, model, base_dataset,
         intrinsic_models[c] = pack
 
     model = model.cpu()
-    print(f"  Client {client_id}: {len(intrinsic_models)} LMPRE class models")
+    print(f"  Client {client_id}: {len(intrinsic_models)} LMUE class models")
     for c, pack in intrinsic_models.items():
         print(
             f"    c{c}: n={pack['n']:5d}, rel={pack['reliability']:.3f}, "
@@ -574,7 +608,7 @@ def fit_client_lmpre_models(client_id, model, base_dataset,
 # Evaluation
 # ============================================================
 @torch.no_grad()
-def evaluate_lmpre(models, intrinsic_models, client_class_counts_fit, test_loader, device):
+def evaluate_lmue(models, intrinsic_models, client_class_counts_fit, test_loader, device):
     test_labels = None
     n_test = len(test_loader.dataset)
 
@@ -625,12 +659,10 @@ def evaluate_lmpre(models, intrinsic_models, client_class_counts_fit, test_loade
 
     results = {}
 
-    # S1: raw max-score
     best_per_class, _ = raw_scores.max(dim=0)
     preds_s1 = best_per_class.argmax(dim=1).numpy()
     results["S1_max_score"] = float((preds_s1 == test_labels).mean())
 
-    # S2: weighted logN on raw z-score
     weighted = torch.zeros(n_test, N_CLASSES)
     denom = torch.zeros(N_CLASSES)
     for k in range(N_CLIENTS):
@@ -650,7 +682,6 @@ def evaluate_lmpre(models, intrinsic_models, client_class_counts_fit, test_loade
     preds_s2 = weighted.argmax(dim=1).numpy()
     results["S2_weighted_logN"] = float((preds_s2 == test_labels).mean())
 
-    # S3: top expert only
     top = torch.full((n_test, N_CLASSES), float("-inf"))
     for c in range(N_CLASSES):
         best_k = -1
@@ -667,7 +698,6 @@ def evaluate_lmpre(models, intrinsic_models, client_class_counts_fit, test_loade
     preds_s3 = top.argmax(dim=1).numpy()
     results["S3_top_expert"] = float((preds_s3 == test_labels).mean())
 
-    # S4: calibrated reliability fusion on probs
     fused_prob = torch.zeros(n_test, N_CLASSES)
     fused_den = torch.zeros(N_CLASSES)
     for k in range(N_CLIENTS):
@@ -687,7 +717,6 @@ def evaluate_lmpre(models, intrinsic_models, client_class_counts_fit, test_loade
     preds_s4 = fused_prob.argmax(dim=1).numpy()
     results["S4_calib_rel_prob"] = float((preds_s4 == test_labels).mean())
 
-    # S5: calibrated reliability fusion on margin
     fused_margin = torch.full((n_test, N_CLASSES), float("-inf"))
     for c in range(N_CLASSES):
         agg_num = torch.zeros(n_test)
@@ -699,6 +728,7 @@ def evaluate_lmpre(models, intrinsic_models, client_class_counts_fit, test_loade
                 if w <= 0:
                     continue
                 agg_num += calib_scores[k, :, c] * w
+                    
                 agg_den += w
                 has_any = True
         if has_any and agg_den > 0:
@@ -718,7 +748,7 @@ def run_experiment(alpha, seed, gpu):
     device = torch.device(f"cuda:{gpu}" if torch.cuda.is_available() else "cpu")
 
     print(f"\n{'='*72}")
-    print(f"  Pipeline LMPRE")
+    print("  Pipeline LMUE (variance-preserved local manifold expert)")
     print(f"  alpha={alpha}  seed={seed}  epochs={EPOCHS}  calib_ratio={CALIB_RATIO}")
     print(f"  feat_dim={FEAT_DIM}  n_proto={N_PROTOS}")
     print(f"{'='*72}")
@@ -759,7 +789,7 @@ def run_experiment(alpha, seed, gpu):
     test_loader = DataLoader(test_ds, batch_size=256, shuffle=False, num_workers=4, pin_memory=True)
 
     print(f"\n{'='*60}")
-    print("  Phase 1: Local LMPRE Training")
+    print("  Phase 1: Local LMUE Training")
     print(f"{'='*60}")
 
     models = {}
@@ -770,7 +800,7 @@ def run_experiment(alpha, seed, gpu):
         idxs = client_train_idx[k]
         if len(idxs) < 2:
             continue
-        model, best_quality = train_client_lmpre(
+        model, best_quality = train_client_lmue(
             k, train_base, idxs, device,
             epochs=EPOCHS, lr=LR, wd=WD,
             feat_dim=FEAT_DIM, n_proto=N_PROTOS,
@@ -789,7 +819,7 @@ def run_experiment(alpha, seed, gpu):
 
     intrinsic_models = {}
     for k in range(N_CLIENTS):
-        intrinsic_models[k] = fit_client_lmpre_models(
+        intrinsic_models[k] = fit_client_lmue_models(
             client_id=k,
             model=models[k],
             base_dataset=train_base,
@@ -804,7 +834,7 @@ def run_experiment(alpha, seed, gpu):
     print("  Phase 3: Evaluation")
     print(f"{'='*60}")
 
-    results = evaluate_lmpre(
+    results = evaluate_lmue(
         models=models,
         intrinsic_models=intrinsic_models,
         client_class_counts_fit=client_class_counts_fit,
@@ -812,7 +842,7 @@ def run_experiment(alpha, seed, gpu):
         device=device,
     )
 
-    print("\n  LMPRE intrinsic results:")
+    print("\n  LMUE intrinsic results:")
     for name, acc in sorted(results.items(), key=lambda x: -x[1]):
         print(f"    {name:24s}: {acc:.2%}")
 
@@ -834,7 +864,7 @@ def run_experiment(alpha, seed, gpu):
         "best_acc": float(best_acc),
         "time_backbone": t_bb,
     }
-    outpath = f"results/pipeline_lmpre_a{alpha}_s{seed}.json"
+    outpath = f"results/pipeline_lmue_a{alpha}_s{seed}.json"
     with open(outpath, "w") as f:
         json.dump(out, f, indent=2)
 
@@ -862,16 +892,21 @@ def main():
 
     parser.add_argument("--n_proto", type=int, default=4)
     parser.add_argument("--tau", type=float, default=0.10)
-    parser.add_argument("--lambda_inst", type=float, default=1.0)
-    parser.add_argument("--lambda_proto", type=float, default=1.0)
-    parser.add_argument("--lambda_rec", type=float, default=0.5)
-    parser.add_argument("--lambda_spread", type=float, default=0.1)
     parser.add_argument("--spread_margin", type=float, default=0.5)
+
+    parser.add_argument("--lambda_inst", type=float, default=1.0)
+    parser.add_argument("--lambda_var", type=float, default=25.0)
+    parser.add_argument("--lambda_cov", type=float, default=1.0)
+    parser.add_argument("--lambda_proto", type=float, default=1.0)
+    parser.add_argument("--lambda_rec", type=float, default=0.25)
+    parser.add_argument("--lambda_spread", type=float, default=0.1)
+    parser.add_argument("--var_target", type=float, default=0.6)
 
     args = parser.parse_args()
 
     global EPOCHS, LR, WD, FEAT_DIM, MIN_SAMPLES, CALIB_RATIO
-    global N_PROTOS, TAU, LAMBDA_INST, LAMBDA_PROTO, LAMBDA_REC, LAMBDA_SPREAD, SPREAD_MARGIN
+    global N_PROTOS, TAU, SPREAD_MARGIN
+    global LAMBDA_INST, LAMBDA_VAR, LAMBDA_COV, LAMBDA_PROTO, LAMBDA_REC, LAMBDA_SPREAD, VAR_TARGET
 
     EPOCHS = args.epochs
     LR = args.lr
@@ -882,11 +917,15 @@ def main():
 
     N_PROTOS = args.n_proto
     TAU = args.tau
+    SPREAD_MARGIN = args.spread_margin
+
     LAMBDA_INST = args.lambda_inst
+    LAMBDA_VAR = args.lambda_var
+    LAMBDA_COV = args.lambda_cov
     LAMBDA_PROTO = args.lambda_proto
     LAMBDA_REC = args.lambda_rec
     LAMBDA_SPREAD = args.lambda_spread
-    SPREAD_MARGIN = args.spread_margin
+    VAR_TARGET = args.var_target
 
     run_experiment(args.alpha, args.seed, args.gpu)
 
