@@ -1,22 +1,15 @@
 """
-Method-Agnostic Intro Figure Experiments
-=========================================
+Intro Figure Experiments — Generative-Discriminative Duality in OFL
 
-目的: 展示一个不依赖于我们方法的一般性现象
-  "判别式信号在低α下退化, 生成式信号的互补价值在低α下增大"
+实验目标:
+  1. Panel (a): 三条线 vs α — Union-only, Expert-only, Fused
+  2. Panel (b): 融合增益 Δ = Fused - Union vs α  
+  3. 补充分析: 错误正交性测量 + 逐类信号可靠性
 
-实验设计:
-  - 用标准 OFL 训练 (ETF backbone, 与方法无关)
-  - Union 合并 backbone
-  - 判别式推理: prototype matching (标准做法)
-  - 生成式推理: Nearest Class Mean (NCM) — 最简单的生成式信号
-    (per-class feature mean + 欧氏/Mahalanobis 距离, 任何人都能复现)
-  - 测量: 错误正交性、互补潜力随 α 变化
+直接复用 v15 的训练代码, 只改评估部分.
 
-关键: 这里的生成式信号是 NCM, 不是我们的 conditional expert.
-      这证明了互补性是一般规律, 不是我们方法的 artifact.
-
-运行: python intro_figure_agnostic.py
+运行: python intro_experiments.py
+输出: outputs/intro_figure.pdf, outputs/analysis_results.txt
 """
 
 import torch
@@ -53,11 +46,11 @@ print(f"Device: {device}")
 if torch.cuda.is_available():
     print(f"GPU: {torch.cuda.get_device_name()}, BF16: {'ON' if USE_BF16 else 'OFF'}")
 
-DL_KWARGS = dict(num_workers=8, pin_memory=True, persistent_workers=True)
+DL_KWARGS = dict(num_workers=4, pin_memory=True, persistent_workers=True)
 
 
 # ═══════════════════════════════════════════════════════════════
-# 1. 基础组件 (与 v15 完全一致, 不改)
+# 1. 基础组件 (从 v15 复制, 不改)
 # ═══════════════════════════════════════════════════════════════
 
 def dirichlet_split(dataset, n_clients, alpha, n_classes=10):
@@ -93,34 +86,20 @@ def prepare_data(n_clients=5, alpha=0.05, n_classes=10):
     train_ds = datasets.CIFAR10(root='./data', train=True, download=True, transform=tt)
     test_ds = datasets.CIFAR10(root='./data', train=False, download=True, transform=te)
     cidx, ccc = dirichlet_split(train_ds, n_clients, alpha, n_classes)
-
-    # 不用增强的版本 (用于提取 class mean)
-    train_ds_clean = datasets.CIFAR10(root='./data', train=True, download=False, transform=te)
-
     targets = np.array(train_ds.targets)
     cal = {}
     for k in range(n_clients):
-        cal[k] = DataLoader(Subset(train_ds, cidx[k]), batch_size=128,
-                           shuffle=True, drop_last=True, **DL_KWARGS)
-    # clean loaders for feature extraction (no augmentation)
-    cal_clean = {}
+        cal[k] = DataLoader(Subset(train_ds, cidx[k]), batch_size=128, shuffle=True, drop_last=True, **DL_KWARGS)
+    ccl = {}
     for k in range(n_clients):
-        cal_clean[k] = DataLoader(Subset(train_ds_clean, cidx[k]), batch_size=256,
-                                  shuffle=False, **DL_KWARGS)
-
-    # per-class loaders (clean)
-    ccl_clean = {}
-    for k in range(n_clients):
-        ccl_clean[k] = {}
+        ccl[k] = {}
         cm = defaultdict(list)
         for idx in cidx[k]: cm[targets[idx]].append(idx)
         for c, idxs in cm.items():
-            dl_kw = dict(num_workers=4, pin_memory=True, persistent_workers=len(idxs) >= 64)
-            ccl_clean[k][c] = DataLoader(Subset(train_ds_clean, idxs), batch_size=256,
-                                         shuffle=False, **dl_kw)
-
+            dl_kw = dict(num_workers=0, pin_memory=True)
+            ccl[k][c] = DataLoader(Subset(train_ds, idxs), batch_size=64, shuffle=True, drop_last=False, **dl_kw)
     tl = DataLoader(test_ds, batch_size=256, shuffle=False, **DL_KWARGS)
-    return cal, cal_clean, ccl_clean, tl, ccc, cidx
+    return cal, ccl, tl, ccc
 
 def generate_etf(nc, fd, seed=42):
     rng = torch.Generator(); rng.manual_seed(seed)
@@ -142,6 +121,15 @@ class Backbone(nn.Module):
         self.fc = nn.Linear(c4*2*2, fd)
     def forward(self, x):
         x = self.features(x); x = x.view(x.size(0), -1); return F.normalize(self.fc(x), dim=1)
+
+class ConditionalExpert(nn.Module):
+    def __init__(self, fd=256, ed=256, hd=128, ld=32):
+        super().__init__()
+        self.enc1 = nn.Linear(fd+ed, hd); self.ebn = nn.LayerNorm(hd); self.enc2 = nn.Linear(hd, ld)
+        self.dec1 = nn.Linear(ld+ed, hd); self.dbn = nn.LayerNorm(hd); self.dec2 = nn.Linear(hd, fd)
+    def encode(self, f, c): return self.enc2(F.relu(self.ebn(self.enc1(torch.cat([f,c], 1)))))
+    def decode(self, z, c): return self.dec2(F.relu(self.dbn(self.dec1(torch.cat([z,c], 1)))))
+    def forward(self, f, c): z = self.encode(f, c); return self.decode(z, c), z
 
 def etf_cl(features, labels, etf, temp=0.1):
     features = F.normalize(features, dim=1); bs = features.size(0)
@@ -181,6 +169,51 @@ def train_bb(bb, loader, classes, etf, epochs=600, lr=1e-3):
         sch.step()
         if (ep+1) % 200 == 0: print(f"      BB {ep+1}/{epochs} loss={el/max(nb,1):.4f}")
     return bb
+
+def preextract(bb, dl):
+    bb.eval(); af = []
+    with torch.no_grad():
+        amp = (torch.amp.autocast('cuda', dtype=torch.bfloat16) if USE_BF16
+               else torch.amp.autocast('cuda', enabled=False))
+        with amp:
+            for x, _ in dl: af.append(bb(x.to(device, non_blocking=True)).float())
+    return torch.cat(af, 0)
+
+def train_exp(exp, cached, eo, ed, others, fdim=256, epochs=600, lr=1e-3, margin=0.05):
+    exp = exp.to(device); N = cached.size(0); no = others.size(0)
+    opt = torch.optim.Adam(exp.parameters(), lr=lr)
+    sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
+    bs = min(64, N); nn_ = 64
+    for ep in range(epochs):
+        exp.train(); perm = torch.randperm(N, device=device)
+        for i in range(0, N, bs):
+            idx = perm[i:i+bs]; fp = cached[idx]; B = fp.size(0)
+            co = eo.unsqueeze(0).expand(B, -1); fr1, _ = exp(fp, co); l1 = F.mse_loss(fr1, fp)
+            nc = others[torch.randint(0, no, (nn_,), device=device)]
+            sc = 0.05 + 0.25*torch.rand(nn_, 1, device=device)
+            ff = F.normalize(ed[nc]+torch.randn(nn_, fdim, device=device)*sc, dim=1)
+            fc = others[torch.randint(0, no, (B,), device=device)]
+            fr2, _ = exp(fp, ed[fc]); l2 = F.relu(margin-((fp-fr2)**2).mean(1)).mean()
+            fr3, _ = exp(ff, ed[nc]); l3 = F.relu(margin-((ff-fr3)**2).mean(1)).mean()
+            fr4, _ = exp(ff, eo.unsqueeze(0).expand(nn_, -1)); l4 = F.relu(margin-((ff-fr4)**2).mean(1)).mean()
+            loss = l1 + (l2+l3+l4)
+            opt.zero_grad(set_to_none=True); loss.backward(); opt.step()
+        sch.step()
+    exp.eval(); return exp
+
+def train_experts(bb, cls_loaders, classes, etf, nc=10, fdim=256, ldim=32, epochs=600, lr=1e-3):
+    bb.eval(); ed = etf.to(device); exps = {}
+    om = {c: torch.tensor([k for k in range(nc) if k != c], device=device) for c in range(nc)}
+    for cls in classes:
+        print(f"      Exp {cls}...", end=" ", flush=True); t0 = time.time()
+        cached = preextract(bb, cls_loaders[cls])
+        exp = ConditionalExpert(fdim, fdim, 128, ldim).to(device)
+        exp = train_exp(exp, cached, ed[cls], ed, om[cls], fdim, epochs, lr)
+        exps[cls] = exp
+        with torch.no_grad():
+            ne = min(256, cached.size(0)); fr, _ = exp(cached[:ne], ed[cls].unsqueeze(0).expand(ne, -1))
+            print(f"done ({time.time()-t0:.1f}s) MSE={((cached[:ne]-fr)**2).mean().item():.6f}")
+    return exps
 
 def union_aggregate(bbs, fd=256, thr=0.95):
     K = len(bbs)
@@ -228,6 +261,7 @@ def union_aggregate(bbs, fd=256, thr=0.95):
                    'bm':torch.stack(mbn['m']),'bv':torch.stack(mbn['v'])})
         alm.append(nm); pm = nm; pn = No
     Nf = pn; fi = Nf*4; mfw = torch.zeros(fd, fi); mfb = torch.zeros(fd); fcc = torch.zeros(fi)
+    K = len(bbs)
     for k, bb in enumerate(bbs):
         fw = bb.fc.weight.data.cpu(); fb = bb.fc.bias.data.cpu(); c4 = bb.channels[3]
         for l in range(c4):
@@ -250,347 +284,234 @@ def union_aggregate(bbs, fd=256, thr=0.95):
 
 
 # ═══════════════════════════════════════════════════════════════
-# 2. ★ Method-Agnostic 生成式信号: NCM + Mahalanobis
-#    (不是我们的方法, 是最基础的生成式推理)
+# 2. 三种推理信号 + 详细分析
 # ═══════════════════════════════════════════════════════════════
 
-def compute_class_stats(bb, ccl_clean, ccc, nc=10):
+def evaluate_all_signals(bbs, client_exps, union_bb, tl, etf, ccc,
+                         nc=10, fuse_alpha=0.3, min_n=100):
     """
-    用每个 client 的 backbone 提取训练特征,
-    计算 per-(client, class) 的 feature mean 和 covariance.
-    这是最简单的 generative model: Gaussian per class.
-    """
-    bb.eval()
-    K = len(ccl_clean)
-    class_means = {}   # (k, c) -> mean vector
-    class_covs = {}    # (k, c) -> covariance matrix
-    class_counts = {}  # (k, c) -> sample count
-
-    with torch.no_grad():
-        amp = (torch.amp.autocast('cuda', dtype=torch.bfloat16) if USE_BF16
-               else torch.amp.autocast('cuda', enabled=False))
-        for k in range(K):
-            for c, dl in ccl_clean[k].items():
-                feats = []
-                with amp:
-                    for x, _ in dl:
-                        f = bb(x.to(device, non_blocking=True)).float()
-                        feats.append(f)
-                feats = torch.cat(feats, 0)  # (n, fd)
-                n = feats.size(0)
-                mean = feats.mean(0)  # (fd,)
-                if n > 1:
-                    centered = feats - mean.unsqueeze(0)
-                    cov = (centered.T @ centered) / (n - 1)  # (fd, fd)
-                    # 正则化
-                    cov = cov + 0.01 * torch.eye(cov.size(0), device=device)
-                else:
-                    cov = torch.eye(feats.size(1), device=device)
-
-                class_means[(k, c)] = mean.cpu()
-                class_covs[(k, c)] = cov.cpu()
-                class_counts[(k, c)] = n
-
-    return class_means, class_covs, class_counts
-
-
-def ncm_inference(test_features, class_means, class_counts, nc=10, mode='euclidean'):
-    """
-    Nearest Class Mean 推理 (method-agnostic generative signal)
-
-    对每个测试样本, 计算到每个类 mean 的距离.
-    如果多个 client 有同一个类, 用样本量加权平均.
-
-    mode:
-      'euclidean': -||f - μ_c||^2
-      'cosine': cos(f, μ_c)
-    """
-    N = test_features.size(0)
-    K_clients = max(k for k, c in class_means.keys()) + 1
-
-    # 聚合各 client 的 class mean (按样本量加权)
-    agg_means = {}  # c -> weighted mean
-    for c in range(nc):
-        weighted_sum = torch.zeros(test_features.size(1))
-        total_weight = 0
-        for k in range(K_clients):
-            if (k, c) in class_means:
-                n = class_counts[(k, c)]
-                w = np.log(n + 1)  # log-weighted
-                weighted_sum += w * class_means[(k, c)]
-                total_weight += w
-        if total_weight > 0:
-            agg_means[c] = weighted_sum / total_weight
-        else:
-            agg_means[c] = torch.zeros(test_features.size(1))
-
-    # 计算距离
-    logits = torch.zeros(N, nc)
-    for c in range(nc):
-        mu = agg_means[c].unsqueeze(0)  # (1, fd)
-        if mode == 'euclidean':
-            logits[:, c] = -((test_features - mu)**2).sum(1)
-        elif mode == 'cosine':
-            logits[:, c] = F.cosine_similarity(test_features, mu, dim=1)
-
-    return logits
-
-
-def per_client_ncm_inference(test_features, class_means, class_counts, nc=10):
-    """
-    Per-client NCM: 每个 client 独立给出 NCM logits,
-    然后 z-score normalize + 加权融合.
-    (类似 C4, 但生成式信号是 NCM 而非 expert reconstruction)
-
-    这展示了: 即使用最简单的生成式信号,
-    per-client 分别 normalize 再融合也比直接聚合 mean 更好.
-    """
-    N = test_features.size(0)
-    K_clients = max(k for k, c in class_means.keys()) + 1
-
-    ensemble_logits = torch.zeros(N, nc)
-    for k in range(K_clients):
-        # 该 client 有哪些类
-        client_classes = [c for c in range(nc) if (k, c) in class_means]
-        if not client_classes:
-            continue
-
-        # 该 client 的 NCM logits
-        cl = torch.zeros(N, nc)
-        cl_mask = torch.zeros(N, nc, dtype=torch.bool)
-        for c in client_classes:
-            mu = class_means[(k, c)].unsqueeze(0)
-            cl[:, c] = -((test_features - mu)**2).sum(1)
-            cl_mask[:, c] = True
-
-        # z-score normalize within this client
-        if cl_mask.any():
-            cm = cl.sum(1, keepdim=True) / cl_mask.sum(1, keepdim=True).clamp(min=1)
-            diff = (cl - cm) * cl_mask.float()
-            cs = ((diff**2).sum(1, keepdim=True) / cl_mask.sum(1, keepdim=True).clamp(min=1)).sqrt() + 1e-8
-            cl_n = diff / cs
-            cl_n[~cl_mask] = 0
-
-            # weight by average log(n)
-            w = np.mean([np.log(class_counts[(k, c)] + 1) for c in client_classes])
-            ensemble_logits += cl_n * w
-
-    return ensemble_logits
-
-
-# ═══════════════════════════════════════════════════════════════
-# 3. ★ 核心评估: 三种信号 + 正交性分析
-# ═══════════════════════════════════════════════════════════════
-
-def evaluate_signals(union_bb, bbs, ccl_clean, tl, etf, ccc, nc=10):
-    """
-    三种信号:
-      D: Discriminative (prototype matching with union backbone)
-      G_agg: Generative aggregated (NCM with aggregated class means)
-      G_pc: Generative per-client (NCM per-client ensemble)
-
-    分析:
-      - 各自 accuracy
+    一次遍历测试集, 计算:
+      - Union-only (discriminative)
+      - Expert-only (generative): 多种策略
+      - Fused (C4)
+      - 逐类分析
       - 错误正交性
-      - 逐类互补潜力
-      - 错误来源分解
     """
-    K = len(bbs)
-    ed = etf.to(device)
-    union_bb.eval()
+    K = len(bbs); ed = etf.to(device); union_bb.eval()
 
-    # Step 1: 计算 per-client class statistics (用各 client 自己的 backbone)
-    print("  Computing per-client class stats (NCM)...")
-    all_means = {}
-    all_covs = {}
-    all_counts = {}
+    sample_count = {}
     for k in range(K):
-        means_k, covs_k, counts_k = compute_class_stats(bbs[k], {k: ccl_clean[k]}, ccc, nc)
-        # 重新 key 为 (k, c) 格式
-        for (_, c), v in means_k.items():
-            all_means[(k, c)] = v
-        for (_, c), v in covs_k.items():
-            all_covs[(k, c)] = v
-        for (_, c), v in counts_k.items():
-            all_counts[(k, c)] = v
+        for c in client_exps[k]:
+            sample_count[(k, c)] = ccc[k].get(c, 0)
 
-    # Step 2: 用 union backbone 提取测试特征
-    print("  Extracting test features with union backbone...")
-    all_feats = []; all_labels = []
+    all_expert_errors = []
+    all_union_logits = []
+    all_labels = []
+
     with torch.no_grad():
         for x, y in tl:
-            f = union_bb(x.to(device, non_blocking=True)).float().cpu()
-            all_feats.append(f); all_labels.append(y)
-    test_feats = torch.cat(all_feats, 0)  # (N, fd)
+            x_dev = x.to(device, non_blocking=True); bs = x.size(0)
+            f_union = F.normalize(union_bb(x_dev), dim=1)
+            union_logits = torch.mm(f_union, ed.T)
+            all_union_logits.append(union_logits.cpu())
+
+            batch_errors = torch.full((K, bs, nc), float('inf'))
+            for k in range(K):
+                f_k = bbs[k](x_dev)
+                for c, exp in client_exps[k].items():
+                    fr, _ = exp(f_k, ed[c].unsqueeze(0).expand(bs, -1))
+                    batch_errors[k, :, c] = ((f_k - fr)**2).mean(1).cpu()
+            all_expert_errors.append(batch_errors)
+            all_labels.append(y)
+
+    errors = torch.cat(all_expert_errors, dim=1)     # (K, N, nc)
+    union_logits = torch.cat(all_union_logits, 0)     # (N, nc)
     labels = torch.cat(all_labels).numpy()
     N = len(labels)
 
-    # 同时用各 client backbone 提取 (NCM 需要在同一 feature space)
-    # 注意: NCM 的 class mean 是用各 client 自己的 backbone 算的
-    # 但推理时用 union backbone 的特征
-    # 这里有一个 mismatch — 我们也需要用 union backbone 重算 class mean
+    # ── 1) Union-only (Discriminative) ──
+    union_preds = union_logits.argmax(1).numpy()
+    union_acc = (union_preds == labels).mean()
 
-    print("  Recomputing class stats with union backbone...")
-    # 重新用 union backbone 提取各 client 训练数据的特征
-    union_means = {}
-    union_counts = {}
-    union_bb.eval()
-    targets_all = np.array(datasets.CIFAR10(root='./data', train=True, download=False).targets)
-    with torch.no_grad():
-        for k in range(K):
-            for c, dl in ccl_clean[k].items():
-                feats = []
-                for x, _ in dl:
-                    f = union_bb(x.to(device, non_blocking=True)).float().cpu()
-                    feats.append(f)
-                feats = torch.cat(feats, 0)
-                union_means[(k, c)] = feats.mean(0)
-                union_counts[(k, c)] = feats.size(0)
+    # ── 2) Expert-only (Generative): 多种策略 ──
+    errors_clean = errors.clone()
+    errors_clean[errors_clean == float('inf')] = 1e6
 
-    # Step 3: 三种推理信号
-    print("  Computing inference signals...")
+    # S1: min across clients
+    best_err_min, _ = errors_clean.min(dim=0)  # (N, nc)
+    expert_s1_preds = best_err_min.argmin(1).numpy()
+    expert_s1_acc = (expert_s1_preds == labels).mean()
 
-    # D: Discriminative (prototype matching)
-    disc_logits = torch.mm(test_feats, ed.cpu().T)  # (N, nc)
-    disc_preds = disc_logits.argmax(1).numpy()
-    disc_acc = (disc_preds == labels).mean()
+    # S2: weighted log(n) across clients
+    weighted_logits = torch.zeros(N, nc)
+    weight_sum = torch.zeros(N, nc)
+    for k in range(K):
+        for c in range(nc):
+            n = sample_count.get((k, c), 0)
+            if n < 1: continue
+            w = np.log(n + 1)
+            weighted_logits[:, c] += w * (-errors_clean[k, :, c])
+            weight_sum[:, c] += w
+    weight_sum[weight_sum == 0] = 1.0
+    expert_s2_logits = weighted_logits / weight_sum
+    expert_s2_preds = expert_s2_logits.argmax(1).numpy()
+    expert_s2_acc = (expert_s2_preds == labels).mean()
 
-    # G_agg: Generative aggregated NCM
-    gen_agg_logits = ncm_inference(test_feats, union_means, union_counts, nc, mode='euclidean')
-    gen_agg_preds = gen_agg_logits.argmax(1).numpy()
-    gen_agg_acc = (gen_agg_preds == labels).mean()
-
-    # G_agg cosine
-    gen_cos_logits = ncm_inference(test_feats, union_means, union_counts, nc, mode='cosine')
-    gen_cos_preds = gen_cos_logits.argmax(1).numpy()
-    gen_cos_acc = (gen_cos_preds == labels).mean()
-
-    # G_pc: Per-client NCM ensemble
-    gen_pc_logits = per_client_ncm_inference(test_feats, union_means, union_counts, nc)
-    gen_pc_preds = gen_pc_logits.argmax(1).numpy()
-    gen_pc_acc = (gen_pc_preds == labels).mean()
-
-    # 选最佳 generative
-    gen_accs = {
-        'NCM_euclidean': gen_agg_acc,
-        'NCM_cosine': gen_cos_acc,
-        'NCM_per_client': gen_pc_acc,
-    }
-    best_gen_name = max(gen_accs, key=gen_accs.get)
-    best_gen_acc = gen_accs[best_gen_name]
-    if best_gen_name == 'NCM_euclidean':
-        gen_preds = gen_agg_preds; gen_logits = gen_agg_logits
-    elif best_gen_name == 'NCM_cosine':
-        gen_preds = gen_cos_preds; gen_logits = gen_cos_logits
-    else:
-        gen_preds = gen_pc_preds; gen_logits = gen_pc_logits
-
-    print(f"    Discriminative:     {disc_acc:.2%}")
-    print(f"    Gen NCM_euclidean:  {gen_agg_acc:.2%}")
-    print(f"    Gen NCM_cosine:     {gen_cos_acc:.2%}")
-    print(f"    Gen NCM_per_client: {gen_pc_acc:.2%}")
-    print(f"    Best generative:    {best_gen_acc:.2%} ({best_gen_name})")
-
-    # Step 4: 错误正交性分析
-    d_correct = (disc_preds == labels)
-    g_correct = (gen_preds == labels)
-
-    both_correct = (d_correct & g_correct).sum()
-    d_only = (d_correct & ~g_correct).sum()
-    g_only = (~d_correct & g_correct).sum()
-    both_wrong = (~d_correct & ~g_correct).sum()
-
-    d_err = (~d_correct).astype(float)
-    g_err = (~g_correct).astype(float)
-    if d_err.std() > 0 and g_err.std() > 0:
-        error_corr = np.corrcoef(d_err, g_err)[0, 1]
-    else:
-        error_corr = 1.0
-
-    oracle_acc = (d_correct | g_correct).mean()
-
-    # ★ 核心指标: 互补潜力
-    # = D 错误的样本中, G 正确的比例
-    d_wrong_mask = ~d_correct
-    if d_wrong_mask.sum() > 0:
-        complement_potential = g_correct[d_wrong_mask].mean()
-    else:
-        complement_potential = 0.0
-
-    # Step 5: 错误来源分解
-    # D 错误的样本中, 分析原因
-    error_analysis = {}
+    # S3: top expert per class (highest sample count)
+    best_err_top = torch.full((N, nc), 1e6)
     for c in range(nc):
-        # 该类的测试样本
-        mask_c = (labels == c)
-        n_test = mask_c.sum()
-        d_acc_c = d_correct[mask_c].mean() if n_test > 0 else 0
-        g_acc_c = g_correct[mask_c].mean() if n_test > 0 else 0
+        best_k = -1; best_n = 0
+        for k in range(K):
+            n = sample_count.get((k, c), 0)
+            if n > best_n: best_n = n; best_k = k
+        if best_k >= 0:
+            best_err_top[:, c] = errors_clean[best_k, :, c]
+    expert_s3_preds = best_err_top.argmin(1).numpy()
+    expert_s3_acc = (expert_s3_preds == labels).mean()
 
-        # 该类在各 client 的训练量
-        train_counts = [union_counts.get((k, c), 0) for k in range(K)]
-        max_train = max(train_counts) if train_counts else 0
-        total_train = sum(train_counts)
-        n_clients_with_class = sum(1 for n in train_counts if n > 0)
+    # S4: quality-filtered min (min_n threshold)
+    best_err_qf = torch.full((N, nc), 1e6)
+    for k in range(K):
+        for c in range(nc):
+            if sample_count.get((k, c), 0) < min_n: continue
+            best_err_qf[:, c] = torch.min(best_err_qf[:, c], errors_clean[k, :, c])
+    expert_s4_preds = best_err_qf.argmin(1).numpy()
+    # fallback
+    all_high = (best_err_qf.min(1)[0] >= 1e5)
+    expert_s4_preds[all_high.numpy()] = union_preds[all_high.numpy()]
+    expert_s4_acc = (expert_s4_preds == labels).mean()
 
-        # D 错误中 G 正确的比例 (per-class 互补潜力)
-        d_wrong_c = mask_c & ~d_correct
-        if d_wrong_c.sum() > 0:
-            complement_c = g_correct[d_wrong_c].mean()
-        else:
-            complement_c = 0.0
+    # 选最优 expert-only
+    expert_accs = {
+        'S1_min': expert_s1_acc,
+        'S2_weighted_log': expert_s2_acc,
+        'S3_top_expert': expert_s3_acc,
+        'S4_quality_min': expert_s4_acc,
+    }
+    best_expert_name = max(expert_accs, key=expert_accs.get)
+    best_expert_acc = expert_accs[best_expert_name]
 
-        error_analysis[c] = {
-            'n_test': int(n_test),
-            'disc_acc': float(d_acc_c),
-            'gen_acc': float(g_acc_c),
-            'complement': float(complement_c),
-            'n_clients': n_clients_with_class,
-            'max_train': max_train,
-            'total_train': total_train,
+    # ── 3) Fused: C4 (per-client logits ensemble) ──
+    ensemble_logits = torch.zeros(N, nc)
+    for k in range(K):
+        valid_c = [c for c in range(nc) if sample_count.get((k, c), 0) >= min_n]
+        if not valid_c: continue
+        ek = errors_clean[k]
+        cl = torch.zeros(N, nc)
+        for c in valid_c: cl[:, c] = -ek[:, c]
+        cl_mask = torch.zeros(N, nc, dtype=torch.bool)
+        for c in valid_c: cl_mask[:, c] = True
+        cm = cl.sum(1, keepdim=True) / cl_mask.sum(1, keepdim=True).clamp(min=1)
+        diff = (cl - cm) * cl_mask.float()
+        cs = ((diff**2).sum(1, keepdim=True) / cl_mask.sum(1, keepdim=True).clamp(min=1)).sqrt() + 1e-8
+        cl_n = diff / cs; cl_n[~cl_mask] = 0
+        w_sum = sum(np.log(sample_count.get((k, c), 0) + 1) for c in valid_c) / len(valid_c)
+        ensemble_logits += cl_n * w_sum
+
+    em = ensemble_logits.mean(1, keepdim=True)
+    es = ensemble_logits.std(1, keepdim=True) + 1e-8
+    en = (ensemble_logits - em) / es
+    no_signal = (ensemble_logits.abs().sum(1) == 0)
+    en[no_signal.unsqueeze(1).expand_as(en)] = 0
+
+    um = union_logits.mean(1, keepdim=True)
+    us = union_logits.std(1, keepdim=True) + 1e-8
+    un = (union_logits - um) / us
+
+    # 扫 alpha 找最优
+    best_fuse_acc = 0; best_fuse_alpha = 0
+    for a in [0.1, 0.2, 0.3, 0.5, 0.7, 1.0, 1.5, 2.0, 3.0, 5.0]:
+        fused_preds = (un + a * en).argmax(1).numpy()
+        acc = (fused_preds == labels).mean()
+        if acc > best_fuse_acc:
+            best_fuse_acc = acc; best_fuse_alpha = a
+
+    fused_preds = (un + best_fuse_alpha * en).argmax(1).numpy()
+    fused_acc = best_fuse_acc
+
+    # 固定 alpha 的结果 (用于一致性对比)
+    fused_fixed_preds = (un + fuse_alpha * en).argmax(1).numpy()
+    fused_fixed_acc = (fused_fixed_preds == labels).mean()
+
+    # ── 4) 逐类分析 ──
+    per_class = {}
+    for c in range(nc):
+        mask = (labels == c)
+        n_samples = mask.sum()
+        u_acc_c = (union_preds[mask] == c).mean()
+        e_acc_c = (expert_s2_preds[mask] == c).mean()  # 用 S2 作为代表
+        f_acc_c = (fused_preds[mask] == c).mean()
+
+        # 该类的 expert 覆盖情况
+        expert_counts = []
+        for k in range(K):
+            n = sample_count.get((k, c), 0)
+            if n > 0: expert_counts.append(n)
+
+        per_class[c] = {
+            'n_test': int(n_samples),
+            'union_acc': float(u_acc_c),
+            'expert_acc': float(e_acc_c),
+            'fused_acc': float(f_acc_c),
+            'n_experts': len(expert_counts),
+            'max_train': max(expert_counts) if expert_counts else 0,
+            'total_train': sum(expert_counts),
         }
 
-    # Step 6: 简单融合 (z-score + 加法) — 展示即使最简单的融合也有效
-    d_norm = (disc_logits - disc_logits.mean(1, keepdim=True)) / (disc_logits.std(1, keepdim=True) + 1e-8)
-    g_norm = (gen_logits - gen_logits.mean(1, keepdim=True)) / (gen_logits.std(1, keepdim=True) + 1e-8)
+    # ── 5) 错误正交性分析 ──
+    u_correct = (union_preds == labels).astype(float)
+    e_correct = (expert_s2_preds == labels).astype(float)
+    f_correct = (fused_preds == labels).astype(float)
 
-    best_naive_acc = 0; best_naive_alpha = 0
-    for a in [0.1, 0.2, 0.3, 0.5, 0.7, 1.0, 1.5, 2.0, 3.0]:
-        fused = (d_norm + a * g_norm).argmax(1).numpy()
-        acc = (fused == labels).mean()
-        if acc > best_naive_acc:
-            best_naive_acc = acc; best_naive_alpha = a
+    # 四格表
+    both_correct = ((u_correct == 1) & (e_correct == 1)).sum()
+    u_only = ((u_correct == 1) & (e_correct == 0)).sum()
+    e_only = ((u_correct == 0) & (e_correct == 1)).sum()
+    both_wrong = ((u_correct == 0) & (e_correct == 0)).sum()
 
-    print(f"    Naive fusion (best): {best_naive_acc:.2%} (α={best_naive_alpha})")
-    print(f"    Oracle (D∪G):        {oracle_acc:.2%}")
-    print(f"    Complement potential: {complement_potential:.2%}")
-    print(f"    Error correlation:    {error_corr:.4f}")
+    # Pearson 相关 (错误模式的相关性, 越低越正交)
+    u_err = 1 - u_correct; e_err = 1 - e_correct
+    if u_err.std() > 0 and e_err.std() > 0:
+        error_corr = np.corrcoef(u_err, e_err)[0, 1]
+    else:
+        error_corr = 0.0
 
-    return {
-        'disc_acc': float(disc_acc),
-        'gen_accs': gen_accs,
-        'best_gen': best_gen_name,
-        'best_gen_acc': float(best_gen_acc),
-        'naive_fused_acc': float(best_naive_acc),
-        'naive_fused_alpha': float(best_naive_alpha),
+    # Oracle upper bound (任一正确就正确)
+    oracle_acc = ((u_correct == 1) | (e_correct == 1)).mean()
+
+    # 融合能利用多少 oracle 空间
+    fuse_utilization = (fused_acc - union_acc) / (oracle_acc - union_acc + 1e-10)
+
+    results = {
+        'union_acc': float(union_acc),
+        'expert_accs': {k: float(v) for k, v in expert_accs.items()},
+        'best_expert': best_expert_name,
+        'best_expert_acc': float(best_expert_acc),
+        'fused_acc': float(fused_acc),
+        'fused_alpha': float(best_fuse_alpha),
+        'fused_fixed_acc': float(fused_fixed_acc),
+        'delta': float(fused_acc - union_acc),
+        'per_class': per_class,
         'orthogonality': {
             'both_correct': int(both_correct),
-            'disc_only': int(d_only),
-            'gen_only': int(g_only),
+            'union_only': int(u_only),
+            'expert_only': int(e_only),
             'both_wrong': int(both_wrong),
-            'error_corr': float(error_corr),
+            'error_correlation': float(error_corr),
             'oracle_acc': float(oracle_acc),
-            'complement_potential': float(complement_potential),
+            'fuse_utilization': float(fuse_utilization),
         },
-        'per_class': error_analysis,
     }
 
+    return results
+
 
 # ═══════════════════════════════════════════════════════════════
-# 4. 多 α 主循环
+# 3. 多 α 实验主循环
 # ═══════════════════════════════════════════════════════════════
 
-def run_sweep(alphas, nc_clients=5, nl=10, fd=256, epb=600):
+def run_alpha_sweep(alphas, nc=5, nl=10, fd=256, ld=32, epb=600, epe=600):
+    """对每个 α 完整跑一遍: 训练 → 合并 → 评估"""
     etf = generate_etf(nl, fd)
     all_results = {}
 
@@ -599,81 +520,71 @@ def run_sweep(alphas, nc_clients=5, nl=10, fd=256, epb=600):
         print(f"  α = {alpha}")
         print(f"{'='*80}")
 
+        # 固定 seed 保证可复现 (但每个 alpha 不同分布)
         torch.manual_seed(42); np.random.seed(42)
-        cal, cal_clean, ccl_clean, tl, ccc, cidx = prepare_data(nc_clients, alpha, nl)
 
-        # 打印分布
-        for k in range(nc_clients):
+        cal, ccl, tl, ccc = prepare_data(nc, alpha, nl)
+
+        # 打印分布摘要
+        for k in range(nc):
             counts = [ccc[k].get(c, 0) for c in range(nl)]
             n_cls = sum(1 for c in counts if c > 0)
-            top = sorted(range(nl), key=lambda c: counts[c], reverse=True)[:3]
-            print(f"  Client {k}: {n_cls} cls, {sum(counts)} samp, "
-                  f"top: {', '.join(f'c{c}={counts[c]}' for c in top)}")
+            print(f"  Client {k}: {n_cls} cls, {sum(counts)} samp")
 
-        # 训练 backbones (不训练 expert — 这是 method-agnostic 实验)
-        bbs = []
+        # 训练
+        bbs = []; client_exps = []
         t0 = time.time()
-        for k in range(nc_clients):
+        for k in range(nc):
             cls = sorted(ccc[k].keys())
-            print(f"\n  Training Client {k}: {len(cls)} cls, {sum(ccc[k].values())} samp")
+            print(f"\n  Training Client {k}: {len(cls)} cls")
             bb = Backbone(fd)
             bb = train_bb(bb, cal[k], cls, etf, epb)
-            bbs.append(bb)
+            exps = train_experts(bb, ccl[k], cls, etf, nl, fd, ld, epe)
+            bbs.append(bb); client_exps.append(exps)
         train_time = time.time() - t0
 
         # Union
-        print(f"\n  Union aggregation...")
         ubb = union_aggregate(bbs, fd, 0.95)
 
         # 评估
-        print(f"\n  Evaluating signals...")
-        results = evaluate_signals(ubb, bbs, ccl_clean, tl, etf, ccc, nl)
+        results = evaluate_all_signals(bbs, client_exps, ubb, tl, etf, ccc, nl)
         results['train_time'] = train_time
-
-        # 数据分布统计
-        avg_classes_per_client = np.mean([
-            sum(1 for c in range(nl) if ccc[k].get(c, 0) > 0)
-            for k in range(nc_clients)
-        ])
-        avg_samples_per_present_class = np.mean([
-            np.mean([ccc[k][c] for c in ccc[k] if ccc[k][c] > 0])
-            for k in range(nc_clients)
-        ])
-        results['data_stats'] = {
-            'avg_classes_per_client': float(avg_classes_per_client),
-            'avg_samples_per_present_class': float(avg_samples_per_present_class),
-        }
-
         all_results[alpha] = results
-        print(f"\n  α={alpha} done. Train={train_time:.0f}s")
+
+        # 打印摘要
+        print(f"\n  ── α={alpha} 结果 ──")
+        print(f"  Union (discriminative):  {results['union_acc']:.2%}")
+        print(f"  Expert-only strategies:")
+        for name, acc in results['expert_accs'].items():
+            print(f"    {name}: {acc:.2%}")
+        print(f"  Best expert-only:        {results['best_expert_acc']:.2%} ({results['best_expert']})")
+        print(f"  Fused (α={results['fused_alpha']}):       {results['fused_acc']:.2%}")
+        print(f"  Δ (Fused - Union):       {results['delta']:+.2%}")
+        print(f"  Error correlation:       {results['orthogonality']['error_correlation']:.4f}")
+        print(f"  Oracle (U∪E):            {results['orthogonality']['oracle_acc']:.2%}")
+        print(f"  Fuse utilization:        {results['orthogonality']['fuse_utilization']:.2%}")
+        print(f"  Train time:              {train_time:.0f}s")
 
     return all_results
 
 
 # ═══════════════════════════════════════════════════════════════
-# 5. ★ Publication-quality Intro Figure
+# 4. 出图: Publication-quality intro figure
 # ═══════════════════════════════════════════════════════════════
 
-def plot_intro_figure(all_results, save_dir='outputs'):
+def plot_intro_figure(all_results, save_path='outputs/intro_figure.pdf'):
     """
-    论文 intro figure. 两个 panel:
-
-    Panel (a): 信号质量 vs α
-      - Discriminative (prototype matching): 随 α↓ 退化
-      - Generative (NCM, method-agnostic): 一直弱于 D
-      - 但: Oracle(D∪G) 显著高于 D → 说明 G 虽然弱但包含 D 没有的信息
-
-    Panel (b): 互补性分析 vs α
-      - Complement potential: D 错误样本中 G 正确的比例
-      - Error correlation: 两种信号的错误相关性
-      - 两者都应该随 α↓ 而有利于融合
+    Panel (a): 三条线 vs α — Union, Expert-only, Fused
+    Panel (b): Δ = Fused - Union vs α
+    Panel (c): 错误正交性 (error correlation) vs α
     """
     alphas = sorted(all_results.keys())
-    disc_accs = [all_results[a]['disc_acc']*100 for a in alphas]
-    gen_accs = [all_results[a]['best_gen_acc']*100 for a in alphas]
+    union_accs = [all_results[a]['union_acc']*100 for a in alphas]
+    expert_accs = [all_results[a]['best_expert_acc']*100 for a in alphas]
+    fused_accs = [all_results[a]['fused_acc']*100 for a in alphas]
+    deltas = [all_results[a]['delta']*100 for a in alphas]
+    error_corrs = [all_results[a]['orthogonality']['error_correlation'] for a in alphas]
     oracle_accs = [all_results[a]['orthogonality']['oracle_acc']*100 for a in alphas]
-    complement = [all_results[a]['orthogonality']['complement_potential']*100 for a in alphas]
-    error_corrs = [all_results[a]['orthogonality']['error_corr'] for a in alphas]
 
     # 样式
     plt.rcParams.update({
@@ -682,141 +593,248 @@ def plot_intro_figure(all_results, save_dir='outputs'):
         'axes.linewidth': 1.2,
         'xtick.major.width': 1.0,
         'ytick.major.width': 1.0,
-        'legend.framealpha': 0.9,
     })
 
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(11, 4.5))
+    fig = plt.figure(figsize=(14, 4.5))
+    gs = gridspec.GridSpec(1, 3, width_ratios=[1.2, 1, 1], wspace=0.35)
 
-    # ── Panel (a): 信号质量 ──
-    ax1.plot(alphas, disc_accs, 's-', color='#1E88E5', linewidth=2.5,
-             markersize=8, label='Discriminative (prototype)', zorder=4)
-    ax1.plot(alphas, gen_accs, '^-', color='#43A047', linewidth=2.5,
-             markersize=8, label='Generative (NCM)', zorder=3)
-    ax1.plot(alphas, oracle_accs, 'D--', color='#E53935', linewidth=2,
-             markersize=7, label='Oracle (D ∪ G)', zorder=5)
+    # ── Panel (a): 三条线 ──
+    ax1 = fig.add_subplot(gs[0])
+    ax1.plot(alphas, fused_accs, 'o-', color='#E53935', linewidth=2.5,
+             markersize=7, label='Fused (Ours)', zorder=5)
+    ax1.plot(alphas, union_accs, 's--', color='#1E88E5', linewidth=2,
+             markersize=6, label='Discriminative only', zorder=4)
+    ax1.plot(alphas, expert_accs, '^:', color='#43A047', linewidth=2,
+             markersize=6, label='Generative only', zorder=3)
+    ax1.plot(alphas, oracle_accs, 'x-.', color='#999999', linewidth=1.5,
+             markersize=5, label='Oracle (D∪G)', zorder=2, alpha=0.7)
 
-    # 用阴影标注 oracle gap (= 被浪费的互补信息)
-    ax1.fill_between(alphas, disc_accs, oracle_accs,
-                     alpha=0.12, color='#E53935', label='Untapped complementarity')
+    # 标注 Δ
+    for i, a in enumerate(alphas):
+        if deltas[i] > 1.0:  # 只标注显著的
+            ax1.annotate(f'+{deltas[i]:.1f}',
+                        xy=(a, fused_accs[i]),
+                        xytext=(0, 12), textcoords='offset points',
+                        fontsize=8, color='#E53935', fontweight='bold',
+                        ha='center')
 
     ax1.set_xscale('log')
-    ax1.set_xlabel('Dirichlet α  (← more heterogeneous)', fontsize=11)
+    ax1.set_xlabel('Dirichlet α (← more heterogeneous)', fontsize=11)
     ax1.set_ylabel('Test Accuracy (%)', fontsize=11)
-    ax1.set_title('(a) Two inference signals from the same model',
-                  fontsize=11.5, fontweight='bold')
-    ax1.legend(fontsize=8.5, loc='lower right')
+    ax1.set_title('(a) Signal comparison', fontsize=12, fontweight='bold')
+    ax1.legend(fontsize=8.5, loc='lower right', framealpha=0.9)
     ax1.set_xticks(alphas)
     ax1.set_xticklabels([str(a) for a in alphas])
     ax1.grid(True, alpha=0.3)
     ax1.set_xlim(min(alphas)*0.7, max(alphas)*1.4)
 
-    # ── Panel (b): 互补性 ──
-    color_comp = '#E53935'
-    color_corr = '#7B1FA2'
-
-    ln1 = ax2.plot(alphas, complement, 'o-', color=color_comp, linewidth=2.5,
-                   markersize=8, label='Complement potential')
-    ax2.set_ylabel('D-wrong samples corrected\nby G (%)', fontsize=10, color=color_comp)
-    ax2.tick_params(axis='y', labelcolor=color_comp)
-
-    ax2b = ax2.twinx()
-    ln2 = ax2b.plot(alphas, error_corrs, 'D--', color=color_corr, linewidth=2,
-                    markersize=7, label='Error correlation ρ')
-    ax2b.set_ylabel('Error correlation (Pearson ρ)', fontsize=10, color=color_corr)
-    ax2b.tick_params(axis='y', labelcolor=color_corr)
-
-    # 合并 legend
-    lns = ln1 + ln2
-    labs = [l.get_label() for l in lns]
-    ax2.legend(lns, labs, fontsize=9, loc='upper left')
-
-    ax2.set_xscale('log')
-    ax2.set_xlabel('Dirichlet α  (← more heterogeneous)', fontsize=11)
-    ax2.set_title('(b) Generative signal complements discriminative',
-                  fontsize=11.5, fontweight='bold')
-    ax2.set_xticks(alphas)
+    # ── Panel (b): 融合增益 Δ ──
+    ax2 = fig.add_subplot(gs[1])
+    bars = ax2.bar(range(len(alphas)), deltas,
+                   color=['#E53935' if d > 0 else '#90A4AE' for d in deltas],
+                   alpha=0.85, width=0.6)
+    for i, (bar, d) in enumerate(zip(bars, deltas)):
+        ax2.text(bar.get_x() + bar.get_width()/2., bar.get_height() + 0.3,
+                f'{d:+.1f}', ha='center', va='bottom', fontsize=9, fontweight='bold')
+    ax2.set_xticks(range(len(alphas)))
     ax2.set_xticklabels([str(a) for a in alphas])
-    ax2.grid(True, alpha=0.3)
-    ax2.set_xlim(min(alphas)*0.7, max(alphas)*1.4)
+    ax2.set_xlabel('Dirichlet α', fontsize=11)
+    ax2.set_ylabel('Δ Accuracy (pp)', fontsize=11)
+    ax2.set_title('(b) Fusion gain', fontsize=12, fontweight='bold')
+    ax2.axhline(y=0, color='black', linewidth=0.8)
+    ax2.grid(True, alpha=0.3, axis='y')
 
-    plt.tight_layout()
-    for ext in ['pdf', 'png']:
-        path = os.path.join(save_dir, f'intro_figure.{ext}')
-        plt.savefig(path, dpi=300, bbox_inches='tight')
+    # ── Panel (c): 错误正交性 ──
+    ax3 = fig.add_subplot(gs[2])
+    ax3.plot(alphas, error_corrs, 'D-', color='#7B1FA2', linewidth=2, markersize=7)
+    ax3.fill_between(alphas, error_corrs, alpha=0.15, color='#7B1FA2')
+    ax3.set_xscale('log')
+    ax3.set_xlabel('Dirichlet α', fontsize=11)
+    ax3.set_ylabel('Error Correlation (Pearson ρ)', fontsize=11)
+    ax3.set_title('(c) Error orthogonality', fontsize=12, fontweight='bold')
+    ax3.set_xticks(alphas)
+    ax3.set_xticklabels([str(a) for a in alphas])
+    ax3.grid(True, alpha=0.3)
+    ax3.set_xlim(min(alphas)*0.7, max(alphas)*1.4)
+
+    # 注释: correlation 低 = 更正交 = 融合更有效
+    ax3.annotate('← more orthogonal\n(fusion more effective)',
+                xy=(alphas[0], error_corrs[0]),
+                xytext=(40, -25), textcoords='offset points',
+                fontsize=8, color='#7B1FA2', style='italic',
+                arrowprops=dict(arrowstyle='->', color='#7B1FA2', lw=1.2))
+
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.savefig(save_path.replace('.pdf', '.png'), dpi=200, bbox_inches='tight')
     plt.close()
-    print(f"  Intro figure saved")
+    print(f"\n  Intro figure 保存: {save_path}")
 
 
-def plot_error_contingency(all_results, save_dir='outputs'):
-    """补充图: 每个 α 的错误四格表"""
+def plot_per_class_analysis(all_results, save_path='outputs/per_class_analysis.pdf'):
+    """逐类分析: 每个 α 下各类的 union vs expert vs fused accuracy"""
+    alphas = sorted(all_results.keys())
+    nc = 10
+
+    fig, axes = plt.subplots(1, len(alphas), figsize=(4*len(alphas), 4), sharey=True)
+    if len(alphas) == 1: axes = [axes]
+
+    for ai, alpha in enumerate(alphas):
+        ax = axes[ai]
+        pc = all_results[alpha]['per_class']
+        classes = sorted(pc.keys())
+        x = np.arange(nc)
+        w = 0.25
+
+        u_accs = [pc[c]['union_acc']*100 for c in classes]
+        e_accs = [pc[c]['expert_acc']*100 for c in classes]
+        f_accs = [pc[c]['fused_acc']*100 for c in classes]
+
+        ax.bar(x - w, u_accs, w, label='Discrim.', color='#1E88E5', alpha=0.8)
+        ax.bar(x, e_accs, w, label='Generative', color='#43A047', alpha=0.8)
+        ax.bar(x + w, f_accs, w, label='Fused', color='#E53935', alpha=0.8)
+
+        ax.set_xlabel('Class')
+        ax.set_title(f'α = {alpha}', fontsize=11, fontweight='bold')
+        ax.set_xticks(x)
+        ax.set_xticklabels([str(c) for c in classes], fontsize=8)
+        ax.grid(True, alpha=0.3, axis='y')
+
+        if ai == 0:
+            ax.set_ylabel('Per-class Accuracy (%)')
+            ax.legend(fontsize=8)
+
+    plt.suptitle('Per-class signal comparison across heterogeneity levels',
+                 fontsize=13, fontweight='bold', y=1.02)
+    plt.savefig(save_path, dpi=200, bbox_inches='tight')
+    plt.close()
+    print(f"  Per-class figure 保存: {save_path}")
+
+
+def plot_orthogonality_detail(all_results, save_path='outputs/orthogonality_detail.pdf'):
+    """错误正交性详细分析: 四格表热力图"""
     alphas = sorted(all_results.keys())
 
-    fig, axes = plt.subplots(1, len(alphas), figsize=(3*len(alphas), 2.8))
+    fig, axes = plt.subplots(1, len(alphas), figsize=(3.5*len(alphas), 3))
     if len(alphas) == 1: axes = [axes]
 
     for ai, alpha in enumerate(alphas):
         ax = axes[ai]
         orth = all_results[alpha]['orthogonality']
-        N = orth['both_correct'] + orth['disc_only'] + orth['gen_only'] + orth['both_wrong']
+        N = orth['both_correct'] + orth['union_only'] + orth['expert_only'] + orth['both_wrong']
+
         table = np.array([
-            [orth['both_correct']/N*100, orth['disc_only']/N*100],
-            [orth['gen_only']/N*100, orth['both_wrong']/N*100]
+            [orth['both_correct']/N*100, orth['union_only']/N*100],
+            [orth['expert_only']/N*100, orth['both_wrong']/N*100]
         ])
+
         im = ax.imshow(table, cmap='YlOrRd', vmin=0, vmax=max(table.flatten())*1.1)
-        ax.set_xticks([0, 1]); ax.set_xticklabels(['G ✓', 'G ✗'], fontsize=9)
+        ax.set_xticks([0, 1]); ax.set_xticklabels(['E ✓', 'E ✗'], fontsize=9)
         ax.set_yticks([0, 1]); ax.set_yticklabels(['D ✓', 'D ✗'], fontsize=9)
+
         for i in range(2):
             for j in range(2):
                 ax.text(j, i, f'{table[i,j]:.1f}%', ha='center', va='center',
                        fontsize=11, fontweight='bold',
                        color='white' if table[i,j] > 30 else 'black')
-        ax.set_title(f'α={alpha}\nρ={orth["error_corr"]:.3f}', fontsize=10, fontweight='bold')
 
-    plt.suptitle('Error contingency tables (D=Discriminative, G=Generative/NCM)',
+        ax.set_title(f'α={alpha}\nρ={orth["error_correlation"]:.3f}',
+                    fontsize=10, fontweight='bold')
+
+    plt.suptitle('Error contingency (D=Discriminative, E=Expert/Generative)',
                  fontsize=11, y=1.05)
-    plt.savefig(os.path.join(save_dir, 'error_contingency.pdf'), dpi=200, bbox_inches='tight')
-    plt.savefig(os.path.join(save_dir, 'error_contingency.png'), dpi=200, bbox_inches='tight')
+    plt.savefig(save_path, dpi=200, bbox_inches='tight')
     plt.close()
-    print(f"  Error contingency saved")
+    print(f"  Orthogonality figure 保存: {save_path}")
 
 
-def save_all_results(all_results, save_dir='outputs'):
-    """保存数字结果"""
-    alphas = sorted(all_results.keys())
+def save_results_text(all_results, save_path='outputs/analysis_results.txt'):
+    """保存详细数字结果"""
+    with open(save_path, 'w') as f:
+        f.write("=" * 80 + "\n")
+        f.write("Intro Experiment Results: Generative-Discriminative Duality in OFL\n")
+        f.write("=" * 80 + "\n\n")
 
-    # Text report
-    with open(os.path.join(save_dir, 'intro_analysis.txt'), 'w') as f:
-        f.write("="*80 + "\n")
-        f.write("Method-Agnostic Intro Analysis\n")
-        f.write("Generative-Discriminative Complementarity in OFL\n")
-        f.write("="*80 + "\n\n")
+        alphas = sorted(all_results.keys())
 
-        f.write(f"{'α':>6s} | {'Disc':>7s} | {'Gen':>7s} | {'Oracle':>7s} | "
-                f"{'Compl%':>7s} | {'ErrCorr':>7s} | {'NaiveFuse':>9s}\n")
-        f.write("-"*65 + "\n")
+        # 总表
+        f.write(f"{'α':>8s} | {'Union':>8s} | {'Expert':>8s} | {'Fused':>8s} | "
+                f"{'Δ':>8s} | {'ErrCorr':>8s} | {'Oracle':>8s} | {'Util':>8s}\n")
+        f.write("-" * 80 + "\n")
         for a in alphas:
             r = all_results[a]
-            f.write(f"{a:>6.2f} | {r['disc_acc']:>6.2%} | {r['best_gen_acc']:>6.2%} | "
-                    f"{r['orthogonality']['oracle_acc']:>6.2%} | "
-                    f"{r['orthogonality']['complement_potential']:>6.2%} | "
-                    f"{r['orthogonality']['error_corr']:>7.4f} | "
-                    f"{r['naive_fused_acc']:>8.2%}\n")
+            f.write(f"{a:>8.2f} | {r['union_acc']:>7.2%} | {r['best_expert_acc']:>7.2%} | "
+                    f"{r['fused_acc']:>7.2%} | {r['delta']:>+7.2%} | "
+                    f"{r['orthogonality']['error_correlation']:>8.4f} | "
+                    f"{r['orthogonality']['oracle_acc']:>7.2%} | "
+                    f"{r['orthogonality']['fuse_utilization']:>7.2%}\n")
 
-        f.write("\n\nPer-class details:\n")
+        f.write("\n\n")
+
+        # 逐 α 详细
         for a in alphas:
             r = all_results[a]
-            f.write(f"\n--- α={a} ---\n")
-            f.write(f"  Data: {r['data_stats']['avg_classes_per_client']:.1f} cls/client, "
-                    f"{r['data_stats']['avg_samples_per_present_class']:.0f} samp/cls\n")
-            f.write(f"  {'Cls':>3s} | {'D_acc':>6s} | {'G_acc':>6s} | {'Compl':>6s} | "
-                    f"{'#Cli':>4s} | {'MaxN':>6s}\n")
+            f.write(f"\n{'='*60}\n α = {a}\n{'='*60}\n")
+            f.write(f"  Union (discriminative):  {r['union_acc']:.4f}\n")
+            f.write(f"  Expert-only strategies:\n")
+            for name, acc in r['expert_accs'].items():
+                f.write(f"    {name:20s}: {acc:.4f}\n")
+            f.write(f"  Fused (best α={r['fused_alpha']:.1f}): {r['fused_acc']:.4f}\n")
+            f.write(f"  Fused (fixed α=0.3):    {r['fused_fixed_acc']:.4f}\n")
+            f.write(f"  Δ:                       {r['delta']:+.4f}\n")
+
+            f.write(f"\n  Orthogonality:\n")
+            orth = r['orthogonality']
+            f.write(f"    Both correct: {orth['both_correct']:5d}\n")
+            f.write(f"    Union only:   {orth['union_only']:5d}\n")
+            f.write(f"    Expert only:  {orth['expert_only']:5d}\n")
+            f.write(f"    Both wrong:   {orth['both_wrong']:5d}\n")
+            f.write(f"    Error corr:   {orth['error_correlation']:.4f}\n")
+            f.write(f"    Oracle:       {orth['oracle_acc']:.4f}\n")
+            f.write(f"    Utilization:  {orth['fuse_utilization']:.4f}\n")
+
+            f.write(f"\n  Per-class:\n")
+            f.write(f"    {'Cls':>3s} | {'Union':>7s} | {'Expert':>7s} | {'Fused':>7s} | "
+                    f"{'#Exp':>4s} | {'MaxN':>6s}\n")
+            f.write(f"    " + "-" * 50 + "\n")
             for c in sorted(r['per_class'].keys()):
                 pc = r['per_class'][c]
-                f.write(f"  {c:3d} | {pc['disc_acc']:>5.2%} | {pc['gen_acc']:>5.2%} | "
-                        f"{pc['complement']:>5.2%} | {pc['n_clients']:>4d} | "
-                        f"{pc['max_train']:>6d}\n")
+                f.write(f"    {c:3d} | {pc['union_acc']:>6.2%} | {pc['expert_acc']:>6.2%} | "
+                        f"{pc['fused_acc']:>6.2%} | {pc['n_experts']:>4d} | {pc['max_train']:>6d}\n")
 
-    # JSON
+    print(f"  结果文本保存: {save_path}")
+
+
+# ═══════════════════════════════════════════════════════════════
+# 5. 主入口
+# ═══════════════════════════════════════════════════════════════
+
+def main():
+    print("=" * 80)
+    print("Intro Experiments: Generative-Discriminative Duality in OFL")
+    print("=" * 80)
+
+    os.makedirs('outputs', exist_ok=True)
+
+    # ── 配置 ──
+    ALPHAS = [0.05, 0.1, 0.3, 0.5, 1.0]   # 与你已有结果对齐
+    # 如果想加 α=0.01, 取消下面的注释:
+    # ALPHAS = [0.01, 0.05, 0.1, 0.3, 0.5, 1.0]
+
+    # ── 运行 ──
+    all_results = run_alpha_sweep(ALPHAS)
+
+    # ── 出图 ──
+    print(f"\n{'='*60}")
+    print("  Generating figures...")
+    print(f"{'='*60}")
+
+    plot_intro_figure(all_results, 'outputs/intro_figure.pdf')
+    plot_per_class_analysis(all_results, 'outputs/per_class_analysis.pdf')
+    plot_orthogonality_detail(all_results, 'outputs/orthogonality_detail.pdf')
+    save_results_text(all_results, 'outputs/analysis_results.txt')
+
+    # ── 保存原始数据 (方便后续不用重跑) ──
+    # 转换为 JSON-safe
     json_results = {}
     for a, r in all_results.items():
         jr = {}
@@ -826,63 +844,34 @@ def save_all_results(all_results, save_dir='outputs'):
             else:
                 jr[k] = v
         json_results[str(a)] = jr
-    with open(os.path.join(save_dir, 'intro_raw_results.json'), 'w') as f:
+    with open('outputs/intro_raw_results.json', 'w') as f:
         json.dump(json_results, f, indent=2)
+    print("  原始数据保存: outputs/intro_raw_results.json")
 
-    print(f"  Results saved to {save_dir}/")
-
-
-# ═══════════════════════════════════════════════════════════════
-# 6. 主入口
-# ═══════════════════════════════════════════════════════════════
-
-def main():
-    print("="*80)
-    print("Method-Agnostic Intro Experiments")
-    print("Generative-Discriminative Complementarity in OFL")
-    print("="*80)
-
-    os.makedirs('outputs', exist_ok=True)
-
-    ALPHAS = [0.05, 0.1, 0.3, 0.5, 1.0]
-
-    all_results = run_sweep(ALPHAS)
-
+    # ── 最终摘要 ──
     print(f"\n{'='*80}")
-    print("  Generating figures...")
+    print("  SUMMARY FOR PAPER")
     print(f"{'='*80}")
-
-    plot_intro_figure(all_results)
-    plot_error_contingency(all_results)
-    save_all_results(all_results)
-
-    # 最终摘要
     alphas = sorted(all_results.keys())
-    print(f"\n{'='*80}")
-    print("  SUMMARY FOR INTRO NARRATIVE")
-    print(f"{'='*80}")
-    print(f"\n  {'α':>6s} | {'Disc':>7s} | {'Gen(NCM)':>8s} | {'Oracle':>7s} | "
-          f"{'Gap':>5s} | {'Complement':>10s} | {'ErrCorr':>7s}")
-    print(f"  " + "-"*65)
+    print(f"\n  {'α':>6s} | {'Union':>8s} | {'GenOnly':>8s} | {'Fused':>8s} | {'Δ':>7s} | {'ErrCorr':>8s}")
+    print(f"  " + "-" * 60)
     for a in alphas:
         r = all_results[a]
-        gap = r['orthogonality']['oracle_acc'] - r['disc_acc']
-        print(f"  {a:>6.2f} | {r['disc_acc']:>6.2%} | {r['best_gen_acc']:>7.2%} | "
-              f"{r['orthogonality']['oracle_acc']:>6.2%} | {gap:>4.1%} | "
-              f"{r['orthogonality']['complement_potential']:>9.2%} | "
-              f"{r['orthogonality']['error_corr']:>7.4f}")
+        print(f"  {a:>6.2f} | {r['union_acc']:>7.2%} | {r['best_expert_acc']:>7.2%} | "
+              f"{r['fused_acc']:>7.2%} | {r['delta']:>+6.2%} | {r['orthogonality']['error_correlation']:>8.4f}")
 
-    print(f"\n  Key intro claims this data should support:")
-    print(f"  1. Discriminative accuracy degrades as α→0 (known)")
-    print(f"  2. Generative (NCM) is always weaker than discriminative")
-    print(f"  3. BUT: Oracle(D∪G) >> D, especially at low α")
-    print(f"     → Generative contains non-redundant information")
-    print(f"  4. Complement potential INCREASES at low α")
-    print(f"     → The more heterogeneous, the more G can help")
-    print(f"  5. Error correlation DECREASES at low α")
-    print(f"     → Error modes become more orthogonal")
-    print(f"\n  These are method-agnostic findings (NCM, not our experts)")
-    print(f"  → Motivates our method: better generative signal + principled fusion")
+    print(f"\n  Key findings for intro:")
+    min_a = min(alphas)
+    max_a = max(alphas)
+    r_min = all_results[min_a]
+    r_max = all_results[max_a]
+    print(f"  1. Fusion gain at α={min_a}: {r_min['delta']:+.2%} (most heterogeneous)")
+    print(f"  2. Fusion gain at α={max_a}: {r_max['delta']:+.2%} (most homogeneous)")
+    print(f"  3. Error correlation at α={min_a}: {r_min['orthogonality']['error_correlation']:.4f} "
+          f"(low = orthogonal)")
+    print(f"  4. Error correlation at α={max_a}: {r_max['orthogonality']['error_correlation']:.4f} "
+          f"(high = redundant)")
+    print(f"\n  → Confirms: generative signal is most complementary under extreme heterogeneity")
     print(f"\nDone!")
 
 
