@@ -5,9 +5,11 @@
 ALPHAS=(0.05 0.1 0.2 0.3 0.5 1.0)
 K=100
 SEED=42
-GPU=0
+GPU=1
 
 mkdir -p results
+mkdir -p logs
+exec > >(tee logs/machine1.log) 2>&1
 
 for alpha in "${ALPHAS[@]}"; do
     out="results/grid_a${alpha}_k${K}_s${SEED}.json"
@@ -22,7 +24,8 @@ for alpha in "${ALPHAS[@]}"; do
         --alpha ${alpha} \
         --n_clients ${K} \
         --seed ${SEED} \
-        --gpu ${GPU}
+        --gpu ${GPU} \
+        --pipeline intrinsic
 done
 
 echo "Machine 1 done."
