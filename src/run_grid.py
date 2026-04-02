@@ -433,14 +433,26 @@ def intrinsic_inference(ssl_models, train_datasets, test_loader, device,
     expert_models = {}  # k -> {c -> pack}
 
     for k in range(n_clients):
+        if k not in ssl_models:
+            expert_models[k] = {}
+            continue
+
         model   = ssl_models[k]
+
+        # fit features
+        if len(client_train_idx[k]) == 0:
+            expert_models[k] = {}
+            continue
         fit_ds  = IndexedDataset(train_datasets, client_train_idx[k], test_transform())
         fit_ldr = DataLoader(fit_ds, 256, shuffle=False, num_workers=4)
         ff, fl, _ = extract_feats(model, fit_ldr, device)
 
-        cal_ds  = IndexedDataset(train_datasets, client_calib_idx[k], test_transform())
-        cal_ldr = DataLoader(cal_ds, 256, shuffle=False, num_workers=4)
-        cf, cl, _ = extract_feats(model, cal_ldr, device)
+        # calib features (may be empty)
+        cf, cl = None, None
+        if len(client_calib_idx[k]) > 0:
+            cal_ds  = IndexedDataset(train_datasets, client_calib_idx[k], test_transform())
+            cal_ldr = DataLoader(cal_ds, 256, shuffle=False, num_workers=4)
+            cf, cl, _ = extract_feats(model, cal_ldr, device)
 
         experts = {}
         for c, n in client_class_counts[k].items():
