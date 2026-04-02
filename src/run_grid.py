@@ -304,9 +304,8 @@ def train_ce_client(client_id, base_dataset, indices, device, epochs=EPOCHS_CE):
     """关系性知识 pipeline：CE 训练"""
     ds     = IndexedDataset(base_dataset, indices, ssl_transform())   # augment during training
     loader = DataLoader(ds, batch_size=min(BATCH_SIZE, len(ds)),
-                        shuffle=True, num_workers=4, pin_memory=True,
-                        drop_last=len(ds) >= BATCH_SIZE,
-                        persistent_workers=len(ds) >= BATCH_SIZE)
+                        shuffle=True, num_workers=0, pin_memory=True,
+                        drop_last=len(ds) >= BATCH_SIZE)
 
     model = CEModel(N_CLASSES, FEAT_DIM).to(device)
     opt   = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WD)
@@ -335,9 +334,8 @@ def train_ssl_client(client_id, base_dataset, indices, device, epochs=EPOCHS_SSL
     """本体性知识 pipeline：SSL dual-positive 训练"""
     ds     = DualPositiveDataset(base_dataset, indices)
     loader = DataLoader(ds, batch_size=min(BATCH_SIZE, len(ds)),
-                        shuffle=True, num_workers=4, pin_memory=True,
-                        drop_last=len(ds) >= BATCH_SIZE,
-                        persistent_workers=len(ds) >= BATCH_SIZE)
+                        shuffle=True, num_workers=0, pin_memory=True,
+                        drop_last=len(ds) >= BATCH_SIZE)
 
     model = SSLModel(FEAT_DIM, PROJ_DIM).to(device)
     opt   = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WD)
@@ -444,14 +442,14 @@ def intrinsic_inference(ssl_models, train_datasets, test_loader, device,
             expert_models[k] = {}
             continue
         fit_ds  = IndexedDataset(train_datasets, client_train_idx[k], test_transform())
-        fit_ldr = DataLoader(fit_ds, 256, shuffle=False, num_workers=4)
+        fit_ldr = DataLoader(fit_ds, 256, shuffle=False, num_workers=0)
         ff, fl, _ = extract_feats(model, fit_ldr, device)
 
         # calib features (may be empty)
         cf, cl = None, None
         if len(client_calib_idx[k]) > 0:
             cal_ds  = IndexedDataset(train_datasets, client_calib_idx[k], test_transform())
-            cal_ldr = DataLoader(cal_ds, 256, shuffle=False, num_workers=4)
+            cal_ldr = DataLoader(cal_ds, 256, shuffle=False, num_workers=0)
             cf, cl, _ = extract_feats(model, cal_ldr, device)
 
         experts = {}
@@ -505,25 +503,25 @@ def intrinsic_inference(ssl_models, train_datasets, test_loader, device,
 # ============================================================
 # Main experiment
 # ============================================================
-def run(alpha, n_clients, seed, gpu):
+def run(alpha, n_clients, seed, gpu, pipeline="both"):
     seed_everything(seed)
     device = torch.device(f"cuda:{gpu}" if torch.cuda.is_available() else "cpu")
 
     print(f"\n{'='*70}")
-    print(f"  alpha={alpha}  K={n_clients}  seed={seed}")
+    print(f"  alpha={alpha}  K={n_clients}  seed={seed}  pipeline={pipeline}")
     print(f"{'='*70}")
 
     train_base = datasets.CIFAR10("./data", train=True, download=True)
     targets    = np.array(train_base.targets)
     test_ds    = datasets.CIFAR10("./data", train=False, transform=test_transform())
-    test_ldr   = DataLoader(test_ds, 256, shuffle=False, num_workers=4, pin_memory=True)
+    test_ldr   = DataLoader(test_ds, 256, shuffle=False, num_workers=0, pin_memory=True)
 
     # partition
     client_indices, client_counts = dirichlet_split(targets, n_clients, alpha, seed)
 
     client_train, client_calib, client_counts_fit = {}, {}, defaultdict(lambda: defaultdict(int))
     for k in range(n_clients):
-        idxs = client_indices.get(k, [])   # client may have received no data
+        idxs = client_indices.get(k, [])
         if len(idxs) == 0:
             client_train[k] = []
             client_calib[k] = []
@@ -542,55 +540,71 @@ def run(alpha, n_clients, seed, gpu):
 
     t0 = time.time()
 
-    # ── Relational pipeline (CE) ──────────────────────────────
-    print(f"\n── Relational Pipeline (CE) ──")
-    ce_models = {}
-    for k in range(n_clients):
-        if len(client_train[k]) < 2: continue
-        ce_models[k] = train_ce_client(k, train_base, client_train[k], device, EPOCHS_CE)
-        if torch.cuda.is_available(): torch.cuda.empty_cache()
+    # 读取已有结果（用于部分跳过）
+    out_path = f"results/grid_a{alpha}_k{n_clients}_s{seed}.json"
+    existing = {}
+    if os.path.exists(out_path):
+        with open(out_path) as f:
+            existing = json.load(f)
 
-    acc_rel, test_labels = relational_inference(ce_models, test_ldr, device, n_clients)
-    print(f"\n  Relational accuracy: {acc_rel:.4f} ({acc_rel:.2%})")
+    acc_rel = existing.get("acc_relational", None)
+    acc_int = existing.get("acc_intrinsic",  None)
+
+    # ── Relational pipeline (CE) ──────────────────────────────
+    if pipeline in ("both", "relational") and acc_rel is None:
+        print(f"\n── Relational Pipeline (CE) ──")
+        ce_models = {}
+        for k in range(n_clients):
+            if len(client_train[k]) < 2: continue
+            ce_models[k] = train_ce_client(k, train_base, client_train[k], device, EPOCHS_CE)
+            if torch.cuda.is_available(): torch.cuda.empty_cache()
+        acc_rel, _ = relational_inference(ce_models, test_ldr, device, n_clients)
+        print(f"\n  Relational accuracy: {acc_rel:.4f} ({acc_rel:.2%})")
+    elif acc_rel is not None:
+        print(f"\n── Relational: SKIP (already saved: {acc_rel:.2%})")
 
     t_ce = time.time() - t0
 
     # ── Intrinsic pipeline (SSL) ──────────────────────────────
-    print(f"\n── Intrinsic Pipeline (SSL+Gaussian) ──")
-    ssl_models = {}
-    for k in range(n_clients):
-        if len(client_train[k]) < 2: continue
-        ssl_models[k] = train_ssl_client(k, train_base, client_train[k], device, EPOCHS_SSL)
-        if torch.cuda.is_available(): torch.cuda.empty_cache()
-
-    acc_int = intrinsic_inference(
-        ssl_models, train_base, test_ldr, device,
-        n_clients, client_train, client_calib, client_counts_fit
-    )
-    print(f"\n  Intrinsic accuracy: {acc_int:.4f} ({acc_int:.2%})")
+    if pipeline in ("both", "intrinsic") and acc_int is None:
+        print(f"\n── Intrinsic Pipeline (SSL+Gaussian) ──")
+        ssl_models = {}
+        for k in range(n_clients):
+            if len(client_train[k]) < 2: continue
+            ssl_models[k] = train_ssl_client(k, train_base, client_train[k], device, EPOCHS_SSL)
+            if torch.cuda.is_available(): torch.cuda.empty_cache()
+        acc_int = intrinsic_inference(
+            ssl_models, train_base, test_ldr, device,
+            n_clients, client_train, client_calib, client_counts_fit
+        )
+        print(f"\n  Intrinsic accuracy: {acc_int:.4f} ({acc_int:.2%})")
+    elif acc_int is not None:
+        print(f"\n── Intrinsic: SKIP (already saved: {acc_int:.2%})")
 
     t_total = time.time() - t0
 
     # ── Save ─────────────────────────────────────────────────
     os.makedirs("results", exist_ok=True)
     out = {
-        "alpha":       alpha,
-        "n_clients":   n_clients,
-        "seed":        seed,
+        "alpha":          alpha,
+        "n_clients":      n_clients,
+        "seed":           seed,
         "acc_relational": acc_rel,
         "acc_intrinsic":  acc_int,
-        "gap":            acc_rel - acc_int,
+        "gap":            (acc_rel - acc_int) if (acc_rel is not None and acc_int is not None) else None,
         "time_total":     t_total,
-        "epochs_ce":   EPOCHS_CE,
-        "epochs_ssl":  EPOCHS_SSL,
+        "epochs_ce":      EPOCHS_CE,
+        "epochs_ssl":     EPOCHS_SSL,
     }
-    path = f"results/grid_a{alpha}_k{n_clients}_s{seed}.json"
-    with open(path, "w") as f:
+    with open(out_path, "w") as f:
         json.dump(out, f, indent=2)
 
+    rel_str = f"{acc_rel:.2%}" if acc_rel is not None else "N/A"
+    int_str = f"{acc_int:.2%}" if acc_int is not None else "N/A"
+    gap_str = f"{acc_rel-acc_int:+.2%}" if (acc_rel is not None and acc_int is not None) else "N/A"
     print(f"\n{'='*70}")
-    print(f"  Relational: {acc_rel:.2%}   Intrinsic: {acc_int:.2%}   Gap: {acc_rel-acc_int:+.2%}")
-    print(f"  Saved: {path}  ({t_total/60:.1f} min)")
+    print(f"  Relational: {rel_str}   Intrinsic: {int_str}   Gap: {gap_str}")
+    print(f"  Saved: {out_path}  ({t_total/60:.1f} min)")
     print(f"{'='*70}\n")
     return out
 
@@ -605,12 +619,15 @@ def main():
     parser.add_argument("--gpu",        type=int,   default=0)
     parser.add_argument("--epochs_ce",  type=int,   default=EPOCHS_CE)
     parser.add_argument("--epochs_ssl", type=int,   default=EPOCHS_SSL)
+    parser.add_argument("--pipeline",   type=str,   default="both",
+                        choices=["both", "relational", "intrinsic"],
+                        help="Which pipeline to run: both / relational / intrinsic")
     args = parser.parse_args()
 
     EPOCHS_CE  = args.epochs_ce
     EPOCHS_SSL = args.epochs_ssl
 
-    run(args.alpha, args.n_clients, args.seed, args.gpu)
+    run(args.alpha, args.n_clients, args.seed, args.gpu, args.pipeline)
 
 
 if __name__ == "__main__":
