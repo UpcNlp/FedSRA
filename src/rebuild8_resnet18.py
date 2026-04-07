@@ -54,9 +54,13 @@ import numpy as np
 from resnet18_filter_merge import ResNet18Backbone, union_aggregate_resnet18
 
 
-def main(ALPHA=0.05, GPU=0):
+def main(ALPHA=0.05, GPU=0, SEED=42):
+    # 覆盖 rebuild8 的全局种子
+    torch.manual_seed(SEED); np.random.seed(SEED)
+    if torch.cuda.is_available(): torch.cuda.manual_seed_all(SEED)
+
     print("\n" + "=" * 80)
-    print("rebuild8 + ResNet-18 Filter Merge")
+    print(f"rebuild8 + ResNet-18 Filter Merge | seed={SEED}")
     print("=" * 80)
 
     NC=5; NL=10; FD=256; LD=32; EPB=600; EPE=600
@@ -194,7 +198,7 @@ def main(ALPHA=0.05, GPU=0):
         'backbone': 'resnet18',
         'alpha': ALPHA,
         'n_clients': NC,
-        'seed': 42,
+        'seed': SEED,
         'train_time': tt,
         'all_results': R,
         'best': sorted_r[0][0],
@@ -202,7 +206,7 @@ def main(ALPHA=0.05, GPU=0):
         'union_acc': R['Baseline: Union'],
         'expert_min_acc': R['Baseline: Expert(min)'],
     }
-    out_path = f"results/resnet18_a{ALPHA}_k{NC}_s42.json"
+    out_path = f"results/resnet18_a{ALPHA}_k{NC}_s{SEED}.json"
     with open(out_path, 'w') as f:
         json.dump(out, f, indent=2)
     print(f"\n  Saved: {out_path}")
@@ -219,7 +223,7 @@ def main(ALPHA=0.05, GPU=0):
         diff = sorted_r[0][1] - cnn_best[1]['c4_best']
         print(f"    差距: {diff:+.2%}")
 
-    plot_results(dict(sorted_r), f'outputs/resnet18_a{ALPHA}.png')
+    plot_results(dict(sorted_r), f'outputs/resnet18_a{ALPHA}_s{SEED}.png')
     print(f"\n  完成!")
     return R
 
@@ -228,11 +232,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--alpha', type=float, default=0.05)
     parser.add_argument('--gpu', type=int, default=0)
+    parser.add_argument('--seed', type=int, default=42)
     args = parser.parse_args()
 
-    # 设置 GPU (rebuild8 里用全局 device)
-    if args.gpu != 0:
-        import rebuild8
-        rebuild8.device = torch.device(f'cuda:{args.gpu}')
-
-    main(args.alpha, args.gpu)
+    print(f"  Using GPU: {args.gpu} | seed: {args.seed}")
+    main(args.alpha, args.gpu, args.seed)
