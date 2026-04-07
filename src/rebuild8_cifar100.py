@@ -1,0 +1,337 @@
+"""
+rebuild8_cifar100.py
+====================
+CIFAR-100 实验, 支持 CNN 和 ResNet-18 backbone.
+
+与 rebuild8.py 共享训练/推理逻辑, 只改:
+  - 数据集: CIFAR-100 (100 类)
+  - Epoch: backbone 300, expert 200 (100 类太多, 需要降)
+  - 跳过样本 < 5 的类 (不训练 expert)
+  - 支持 --backbone cnn/resnet18
+
+用法:
+  # CNN backbone
+  python rebuild8_cifar100.py --alpha 0.05 --backbone cnn
+
+  # ResNet-18 backbone
+  CUDA_VISIBLE_DEVICES=0 python rebuild8_cifar100.py --alpha 0.05 --backbone resnet18
+
+  # 串行跑所有
+  CUDA_VISIBLE_DEVICES=0 python rebuild8_cifar100.py --alpha 0.05 --backbone resnet18 && \
+  CUDA_VISIBLE_DEVICES=0 python rebuild8_cifar100.py --alpha 0.1  --backbone resnet18 && \
+  CUDA_VISIBLE_DEVICES=0 python rebuild8_cifar100.py --alpha 0.3  --backbone resnet18 && \
+  CUDA_VISIBLE_DEVICES=0 python rebuild8_cifar100.py --alpha 0.5  --backbone resnet18
+"""
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, Subset
+from torchvision import datasets, transforms
+import numpy as np
+import warnings
+import json
+import time
+import os
+import argparse
+from collections import defaultdict
+
+warnings.filterwarnings('ignore')
+
+# ── 从 rebuild8 导入共享组件 ──
+from rebuild8 import (
+    device, USE_BF16, DL_KWARGS,
+    dirichlet_split, generate_etf,
+    Backbone, ConditionalExpert,
+    etf_cl, etf_al, train_bb, preextract, train_exp,
+    compute_stats, precompute_all,
+    expert_original, expert_quality_filter, expert_quality_min,
+    expert_top_quality,
+    _get_expert_preds_and_margin, _union_norm,
+    route_ensemble_logits, route_ensemble_quality,
+    cross_client_voting, cross_client_per_client_logits,
+    d1_weight_schemes, d3_softmax_ensemble, d4_adaptive_alpha,
+    union_aggregate,
+)
+
+from resnet18_filter_merge import ResNet18Backbone, union_aggregate_resnet18
+
+
+# ═══════════════════════════════════════════════════════════
+# CIFAR-100 数据准备
+# ═══════════════════════════════════════════════════════════
+
+CIFAR100_MEAN = (0.5071, 0.4867, 0.4408)
+CIFAR100_STD  = (0.2675, 0.2565, 0.2761)
+
+def prepare_data_cifar100(n_clients=5, alpha=0.05, n_classes=100):
+    tt = transforms.Compose([
+        transforms.RandomHorizontalFlip(), transforms.RandomCrop(32, padding=4),
+        transforms.RandomApply([transforms.ColorJitter(0.4,0.4,0.4,0.1)], p=0.8),
+        transforms.RandomGrayscale(p=0.2), transforms.RandomRotation(15),
+        transforms.ToTensor(),
+        transforms.Normalize(CIFAR100_MEAN, CIFAR100_STD),
+        transforms.RandomErasing(p=0.25, scale=(0.02,0.2)),
+    ])
+    te = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize(CIFAR100_MEAN, CIFAR100_STD),
+    ])
+    train_ds = datasets.CIFAR100(root='./data', train=True, download=True, transform=tt)
+    test_ds  = datasets.CIFAR100(root='./data', train=False, download=True, transform=te)
+    cidx, ccc = dirichlet_split(train_ds, n_clients, alpha, n_classes)
+
+    print(f"\n数据分布 (α={alpha}, CIFAR-100, {n_classes} 类):")
+    for k in range(n_clients):
+        counts = [ccc[k].get(c,0) for c in range(n_classes)]
+        n_cls = sum(1 for c in counts if c > 0)
+        total = sum(counts)
+        print(f"  Client {k}: {n_cls}/{n_classes} cls, {total} samp")
+
+    targets = np.array(train_ds.targets)
+    cal = {}
+    for k in range(n_clients):
+        cal[k] = DataLoader(Subset(train_ds, cidx[k]), batch_size=128,
+                            shuffle=True, drop_last=True, **DL_KWARGS)
+    ccl = {}
+    for k in range(n_clients):
+        ccl[k] = {}
+        cm = defaultdict(list)
+        for idx in cidx[k]: cm[targets[idx]].append(idx)
+        for c, idxs in cm.items():
+            dl_kw = dict(num_workers=2, pin_memory=True,
+                         persistent_workers=len(idxs)>=32)
+            ccl[k][c] = DataLoader(Subset(train_ds, idxs), batch_size=64,
+                                   shuffle=True, drop_last=False, **dl_kw)
+    tl = DataLoader(test_ds, batch_size=256, shuffle=False, **DL_KWARGS)
+    return cal, ccl, tl, ccc
+
+
+# ═══════════════════════════════════════════════════════════
+# CIFAR-100 专用 train_experts (跳过小类, 打印进度)
+# ═══════════════════════════════════════════════════════════
+
+def train_experts_cifar100(bb, cls_loaders, classes, etf, ccc_k,
+                           nc=100, fdim=256, ldim=32, epochs=200,
+                           lr=1e-3, min_samples=5):
+    """训练 expert, 跳过样本 < min_samples 的类"""
+    bb.eval(); ed = etf.to(device); exps = {}
+    om = {c: torch.tensor([k for k in range(nc) if k!=c], device=device)
+          for c in range(nc)}
+
+    trainable = [c for c in classes if ccc_k.get(c, 0) >= min_samples]
+    skipped = len(classes) - len(trainable)
+    total = len(trainable)
+
+    for i, cls in enumerate(trainable):
+        t0 = time.time()
+        cached = preextract(bb, cls_loaders[cls])
+        if cached.size(0) < min_samples:
+            skipped += 1; continue
+        exp = ConditionalExpert(fdim, fdim, 128, ldim).to(device)
+        exp = train_exp(exp, cached, ed[cls], ed, om[cls], fdim, epochs, lr)
+        exps[cls] = exp
+        if (i+1) % max(1, total//5) == 0 or i == total-1:
+            print(f"      Expert {i+1}/{total} done ({time.time()-t0:.1f}s/each)")
+
+    if skipped > 0:
+        print(f"      (跳过 {skipped} 个类, 样本<{min_samples})")
+    return exps
+
+
+# ═══════════════════════════════════════════════════════════
+# 主实验
+# ═══════════════════════════════════════════════════════════
+
+def main(ALPHA=0.05, backbone_type='resnet18'):
+    print("\n" + "=" * 80)
+    print(f"CIFAR-100 | Backbone: {backbone_type} | α={ALPHA}")
+    print("=" * 80)
+
+    NC = 5; NL = 100; FD = 256; LD = 32
+    EPB = 300; EPE = 200  # CIFAR-100: 降低 epoch
+
+    os.makedirs('outputs', exist_ok=True)
+    os.makedirs('results', exist_ok=True)
+
+    etf = generate_etf(NL, FD)
+    cal, ccl, tl, ccc = prepare_data_cifar100(NC, ALPHA, NL)
+
+    # ── Phase 1: 训练 ──
+    print(f"\n{'='*60}")
+    print(f"  Phase 1: 训练 ({backbone_type}, EPB={EPB}, EPE={EPE})")
+    print(f"{'='*60}")
+
+    bbs = []; client_exps = []; t0 = time.time()
+    for k in range(NC):
+        cls = sorted(ccc[k].keys())
+        n_samp = sum(ccc[k].values())
+        n_cls = len(cls)
+        print(f"\n  Client {k}: {n_cls}/{NL} cls, {n_samp} samp")
+
+        # 选择 backbone
+        if backbone_type == 'resnet18':
+            bb = ResNet18Backbone(FD)
+        else:
+            bb = Backbone(FD)
+
+        bb = train_bb(bb, cal[k], cls, etf, EPB)
+        exps = train_experts_cifar100(bb, ccl[k], cls, etf, ccc[k],
+                                       nc=NL, fdim=FD, ldim=LD, epochs=EPE)
+        bbs.append(bb); client_exps.append(exps)
+        print(f"    训练了 {len(exps)} 个 expert")
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    tt = time.time() - t0
+    print(f"\n  训练完成: {tt:.0f}s ({tt/60:.1f}min)")
+
+    # ── Phase 2: Union ──
+    print(f"\n{'='*60}")
+    print(f"  Phase 2: Filter Merge ({backbone_type})")
+    print(f"{'='*60}")
+
+    if backbone_type == 'resnet18':
+        ubb = union_aggregate_resnet18(bbs, FD, 0.95, device)
+    else:
+        ubb = union_aggregate(bbs, FD, 0.95)
+
+    # ── Phase 3: 预计算 ──
+    print(f"\n{'='*60}")
+    print(f"  Phase 3: 预计算")
+    print(f"{'='*60}")
+    data = precompute_all(bbs, client_exps, ubb, tl, etf, ccc, NL)
+    labels = data['labels']
+    N = data['N']
+
+    # ── Phase 4: 评估 ──
+    print(f"\n{'='*60}")
+    print(f"  Phase 4: 策略评估")
+    print(f"{'='*60}")
+    R = {}
+
+    # Baselines
+    print(f"\n  --- Baselines ---")
+    R['Baseline: Union'] = float((data['union_preds'] == labels).mean())
+    print(f"  Union:           {R['Baseline: Union']:.2%}")
+
+    preds = expert_original(data)
+    R['Baseline: Expert(min)'] = float((preds == labels).mean())
+    print(f"  Expert (min):    {R['Baseline: Expert(min)']:.2%}")
+
+    # Oracle
+    e_pred, _, _ = _get_expert_preds_and_margin(data)
+    u_correct = (data['union_preds'] == labels)
+    e_correct = (e_pred == labels)
+    R['Oracle: U∪E'] = float((u_correct | e_correct).mean())
+    print(f"  Oracle (U∪E):    {R['Oracle: U∪E']:.2%}")
+
+    # A: Expert 聚合
+    print(f"\n  --- Expert 聚合 ---")
+    for min_n in [20, 50, 100]:
+        preds = expert_quality_min(data, min_n=min_n)
+        tag = f'A3 QualMin n≥{min_n}'
+        R[tag] = float((preds == labels).mean())
+        print(f"  {tag}: {R[tag]:.2%}")
+
+    preds = expert_top_quality(data)
+    R['A4 TopQuality'] = float((preds == labels).mean())
+    print(f"  A4 TopQuality:    {R['A4 TopQuality']:.2%}")
+
+    # B: Ensemble
+    print(f"\n  --- Ensemble ---")
+    for alpha in [0.3, 0.5, 1.0, 2.0]:
+        preds = route_ensemble_logits(data, alpha=alpha)
+        tag = f'B6 Ensemble α={alpha}'
+        R[tag] = float((preds == labels).mean())
+        print(f"  {tag}: {R[tag]:.2%}")
+
+    for alpha in [0.3, 0.5, 1.0]:
+        for min_n in [20, 50]:
+            preds = route_ensemble_quality(data, alpha=alpha, min_n=min_n)
+            tag = f'B7 QualEns α={alpha} n≥{min_n}'
+            R[tag] = float((preds == labels).mean())
+            print(f"  {tag}: {R[tag]:.2%}")
+
+    # C: 跨 Client
+    print(f"\n  --- 跨 Client ---")
+    for min_n in [0, 20, 50]:
+        preds = cross_client_voting(data, min_n=min_n)
+        tag = f'C1 Vote n≥{min_n}'
+        R[tag] = float((preds == labels).mean())
+        print(f"  {tag}: {R[tag]:.2%}")
+
+    for alpha in [0.3, 0.5, 1.0, 2.0]:
+        for min_n in [0, 20, 50]:
+            preds = cross_client_per_client_logits(data, alpha=alpha, min_n=min_n)
+            tag = f'C4 PCEns α={alpha} n≥{min_n}'
+            R[tag] = float((preds == labels).mean())
+            print(f"  {tag}: {R[tag]:.2%}")
+
+    # D: 深挖 Ensemble
+    print(f"\n  --- 深挖 Ensemble ---")
+    for wt in ['log', 'sqrt']:
+        for alpha in [0.2, 0.3, 0.5, 1.0]:
+            preds = d1_weight_schemes(data, alpha=alpha, min_n=20, weight_type=wt)
+            tag = f'D1 {wt} α={alpha}'
+            R[tag] = float((preds == labels).mean())
+        best_a = max([R[f'D1 {wt} α={a}'] for a in [0.2, 0.3, 0.5, 1.0]])
+        print(f"  D1 {wt:5s}: best={best_a:.2%}")
+
+    for tau in [0.01, 0.1]:
+        for alpha in [0.3, 0.5, 1.0]:
+            preds = d3_softmax_ensemble(data, alpha=alpha, min_n=20, tau=tau)
+            tag = f'D3 softmax τ={tau} α={alpha}'
+            R[tag] = float((preds == labels).mean())
+        best_a = max([R[f'D3 softmax τ={tau} α={a}'] for a in [0.3, 0.5, 1.0]])
+        print(f"  D3 τ={tau}: best={best_a:.2%}")
+
+    for base in [0.2, 0.3, 0.5]:
+        preds = d4_adaptive_alpha(data, base_alpha=base, min_n=20)
+        tag = f'D4 adaptive base={base}'
+        R[tag] = float((preds == labels).mean())
+        print(f"  {tag}: {R[tag]:.2%}")
+
+    # ── 总结 ──
+    print(f"\n{'='*70}")
+    print(f"★ CIFAR-100 {backbone_type} 结果 (Top 20), α={ALPHA}")
+    print(f"{'='*70}")
+    sorted_r = sorted(R.items(), key=lambda x: -x[1])
+    baseline_u = R['Baseline: Union']
+    for i, (name, acc) in enumerate(sorted_r[:20]):
+        diff = acc - baseline_u
+        print(f"  {i+1:2d}. {name:<35s} | {acc:>8.2%} "
+              f"(vs Union {'+' if diff>=0 else ''}{diff*100:.2f}pp)")
+
+    # ── 保存 JSON ──
+    out = {
+        'dataset': 'cifar100',
+        'backbone': backbone_type,
+        'alpha': ALPHA,
+        'n_clients': NC,
+        'n_classes': NL,
+        'seed': 42,
+        'epochs_bb': EPB,
+        'epochs_exp': EPE,
+        'train_time': tt,
+        'all_results': R,
+        'best': sorted_r[0][0],
+        'best_acc': sorted_r[0][1],
+        'union_acc': R['Baseline: Union'],
+        'expert_min_acc': R['Baseline: Expert(min)'],
+    }
+    out_path = f"results/cifar100_{backbone_type}_a{ALPHA}_k{NC}_s42.json"
+    with open(out_path, 'w') as f:
+        json.dump(out, f, indent=2)
+    print(f"\n  Saved: {out_path}")
+    print(f"  训练: {tt:.0f}s, 完成!")
+    return R
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--alpha', type=float, default=0.05)
+    parser.add_argument('--backbone', type=str, default='resnet18',
+                        choices=['cnn', 'resnet18'])
+    args = parser.parse_args()
+    main(args.alpha, args.backbone)

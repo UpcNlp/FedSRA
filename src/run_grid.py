@@ -407,10 +407,16 @@ def relational_inference(ce_models, test_loader, device, n_clients):
     test_labels = None
 
     for k in range(n_clients):
+        if k not in ce_models:          # ← 跳过未训练的 client
+            continue
         feats, labels, logits = extract_feats(ce_models[k], test_loader, device, is_ce=True)
         all_logits.append(logits)
         if test_labels is None:
             test_labels = labels.numpy()
+
+    if len(all_logits) == 0:
+        print("  [WARN] No CE models available for ensemble!")
+        return 0.0, np.zeros(len(test_loader.dataset), dtype=int)
 
     # simple average ensemble
     ensemble = torch.stack(all_logits, 0).mean(0)
@@ -431,14 +437,14 @@ def intrinsic_inference(ssl_models, train_datasets, test_loader, device,
     expert_models = {}  # k -> {c -> pack}
 
     for k in range(n_clients):
-        if k not in ssl_models:
+        if k not in ssl_models:         # ← 跳过未训练的 client
             expert_models[k] = {}
             continue
 
         model   = ssl_models[k]
 
         # fit features
-        if len(client_train_idx[k]) == 0:
+        if len(client_train_idx.get(k, [])) == 0:
             expert_models[k] = {}
             continue
         fit_ds  = IndexedDataset(train_datasets, client_train_idx[k], test_transform())
@@ -447,13 +453,13 @@ def intrinsic_inference(ssl_models, train_datasets, test_loader, device,
 
         # calib features (may be empty)
         cf, cl = None, None
-        if len(client_calib_idx[k]) > 0:
+        if len(client_calib_idx.get(k, [])) > 0:
             cal_ds  = IndexedDataset(train_datasets, client_calib_idx[k], test_transform())
             cal_ldr = DataLoader(cal_ds, 256, shuffle=False, num_workers=0)
             cf, cl, _ = extract_feats(model, cal_ldr, device)
 
         experts = {}
-        for c, n in client_class_counts[k].items():
+        for c, n in client_class_counts.get(k, {}).items():
             if n < MIN_SAMPLES: continue
             fc   = ff[fl == c]
             if len(fc) < MIN_SAMPLES: continue
@@ -485,7 +491,7 @@ def intrinsic_inference(ssl_models, train_datasets, test_loader, device,
     weighted = torch.zeros(n_test, N_CLASSES)
     denom    = torch.zeros(N_CLASSES)
     for k in range(n_clients):
-        for c, pack in expert_models[k].items():
+        for c, pack in expert_models.get(k, {}).items():
             w    = math.log(pack["n"] + 1.0)
             valid = torch.isfinite(raw_scores[k, :, c])
             if valid.any():
@@ -496,6 +502,8 @@ def intrinsic_inference(ssl_models, train_datasets, test_loader, device,
         else: weighted[:, c] = float("-inf")
 
     preds = weighted.argmax(1).numpy()
+    if test_labels is None:
+        test_labels = np.zeros(n_test, dtype=int)
     acc   = float((preds == test_labels).mean())
     return acc
 
@@ -555,7 +563,7 @@ def run(alpha, n_clients, seed, gpu, pipeline="both"):
         print(f"\n── Relational Pipeline (CE) ──")
         ce_models = {}
         for k in range(n_clients):
-            if len(client_train[k]) < 2: continue
+            if len(client_train.get(k, [])) < 2: continue
             ce_models[k] = train_ce_client(k, train_base, client_train[k], device, EPOCHS_CE)
             if torch.cuda.is_available(): torch.cuda.empty_cache()
         acc_rel, _ = relational_inference(ce_models, test_ldr, device, n_clients)
@@ -570,7 +578,7 @@ def run(alpha, n_clients, seed, gpu, pipeline="both"):
         print(f"\n── Intrinsic Pipeline (SSL+Gaussian) ──")
         ssl_models = {}
         for k in range(n_clients):
-            if len(client_train[k]) < 2: continue
+            if len(client_train.get(k, [])) < 2: continue
             ssl_models[k] = train_ssl_client(k, train_base, client_train[k], device, EPOCHS_SSL)
             if torch.cuda.is_available(): torch.cuda.empty_cache()
         acc_int = intrinsic_inference(
