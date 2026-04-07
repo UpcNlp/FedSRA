@@ -92,18 +92,19 @@ def prepare_data_cifar100(n_clients=5, alpha=0.05, n_classes=100):
     cal = {}
     for k in range(n_clients):
         cal[k] = DataLoader(Subset(train_ds, cidx[k]), batch_size=128,
-                            shuffle=True, drop_last=True, **DL_KWARGS)
+                            shuffle=True, drop_last=True,
+                            num_workers=4, pin_memory=True)
     ccl = {}
     for k in range(n_clients):
         ccl[k] = {}
         cm = defaultdict(list)
         for idx in cidx[k]: cm[targets[idx]].append(idx)
         for c, idxs in cm.items():
-            dl_kw = dict(num_workers=2, pin_memory=True,
-                         persistent_workers=len(idxs)>=32)
             ccl[k][c] = DataLoader(Subset(train_ds, idxs), batch_size=64,
-                                   shuffle=True, drop_last=False, **dl_kw)
-    tl = DataLoader(test_ds, batch_size=256, shuffle=False, **DL_KWARGS)
+                                   shuffle=True, drop_last=False,
+                                   num_workers=0, pin_memory=True)
+    tl = DataLoader(test_ds, batch_size=256, shuffle=False,
+                    num_workers=4, pin_memory=True)
     return cal, ccl, tl, ccc
 
 
@@ -143,9 +144,13 @@ def train_experts_cifar100(bb, cls_loaders, classes, etf, ccc_k,
 # 主实验
 # ═══════════════════════════════════════════════════════════
 
-def main(ALPHA=0.05, backbone_type='resnet18'):
+def main(ALPHA=0.05, backbone_type='resnet18', SEED=42):
+    # 覆盖 rebuild8 的全局种子
+    torch.manual_seed(SEED); np.random.seed(SEED)
+    if torch.cuda.is_available(): torch.cuda.manual_seed_all(SEED)
+
     print("\n" + "=" * 80)
-    print(f"CIFAR-100 | Backbone: {backbone_type} | α={ALPHA}")
+    print(f"CIFAR-100 | Backbone: {backbone_type} | α={ALPHA} | seed={SEED}")
     print("=" * 80)
 
     NC = 5; NL = 100; FD = 256; LD = 32
@@ -310,7 +315,7 @@ def main(ALPHA=0.05, backbone_type='resnet18'):
         'alpha': ALPHA,
         'n_clients': NC,
         'n_classes': NL,
-        'seed': 42,
+        'seed': SEED,
         'epochs_bb': EPB,
         'epochs_exp': EPE,
         'train_time': tt,
@@ -320,7 +325,7 @@ def main(ALPHA=0.05, backbone_type='resnet18'):
         'union_acc': R['Baseline: Union'],
         'expert_min_acc': R['Baseline: Expert(min)'],
     }
-    out_path = f"results/cifar100_{backbone_type}_a{ALPHA}_k{NC}_s42.json"
+    out_path = f"results/cifar100_{backbone_type}_a{ALPHA}_k{NC}_s{SEED}.json"
     with open(out_path, 'w') as f:
         json.dump(out, f, indent=2)
     print(f"\n  Saved: {out_path}")
@@ -333,5 +338,6 @@ if __name__ == "__main__":
     parser.add_argument('--alpha', type=float, default=0.05)
     parser.add_argument('--backbone', type=str, default='resnet18',
                         choices=['cnn', 'resnet18'])
+    parser.add_argument('--seed', type=int, default=42)
     args = parser.parse_args()
-    main(args.alpha, args.backbone)
+    main(args.alpha, args.backbone, args.seed)
