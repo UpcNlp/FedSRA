@@ -1,29 +1,20 @@
 """
 verify_tiny.py
 ==============
-快速验证 Tiny-ImageNet 上的关键假设:
-  1. FD=256 vs FD=512: ETF 维度是否是瓶颈
-  2. thr=0.95 vs 0.90 vs 0.85: filter merge 阈值影响
-  3. EPB=300 vs EPB=500: 训练 epoch 是否不足
+快速验证 Tiny-ImageNet 上的关键假设.
 
-只跑 α=0.05, seed=42, 一个配置约 5 小时.
-所有配置共享数据划分, 结果保存到 results/verify_tiny_*.json
+训练只做一次, 然后对多个 thr 值做 filter merge + 推理 (不重新训练).
+不同 FD 需要重新训练, 所以分开跑.
 
 用法:
-  # 验证 FD
-  CUDA_VISIBLE_DEVICES=0 python verify_tiny.py --exp fd --fd 512
-  CUDA_VISIBLE_DEVICES=0 python verify_tiny.py --exp fd --fd 256   # baseline
+  # FD=256 + 4个thr (训练1次, 推理4次)
+  CUDA_VISIBLE_DEVICES=0 python verify_tiny.py --fd 256 --alpha 0.5
 
-  # 验证 thr
-  CUDA_VISIBLE_DEVICES=0 python verify_tiny.py --exp thr --thr 0.85
-  CUDA_VISIBLE_DEVICES=0 python verify_tiny.py --exp thr --thr 0.90
-  CUDA_VISIBLE_DEVICES=0 python verify_tiny.py --exp thr --thr 0.95  # baseline
+  # FD=512 + 4个thr
+  CUDA_VISIBLE_DEVICES=0 python verify_tiny.py --fd 512 --alpha 0.5
 
-  # 验证 epoch
-  CUDA_VISIBLE_DEVICES=0 python verify_tiny.py --exp epoch --epb 500 --epe 300
-
-  # 一次全跑 (串行)
-  CUDA_VISIBLE_DEVICES=0 python verify_tiny.py --exp all
+  # 更多 epoch
+  CUDA_VISIBLE_DEVICES=0 python verify_tiny.py --fd 256 --alpha 0.5 --epb 500 --epe 300
 """
 
 import torch
@@ -52,34 +43,33 @@ from rebuild8 import (
 )
 
 from resnet18_filter_merge import (
-    BasicBlock, ResNet18Backbone, union_aggregate_resnet18,
+    BasicBlock, union_aggregate_resnet18,
 )
 
 from rebuild8_tinyimagenet import (
     TINY_MEAN, TINY_STD,
     TinyImageNetValDataset,
     prepare_data_tinyimagenet,
-    ResNet18Backbone64,
     train_experts_tiny,
 )
 
 
 # ═══════════════════════════════════════════════════════════
-# ResNet18 支持可变 FD (512 维)
+# ResNet18 支持可变 FD
 # ═══════════════════════════════════════════════════════════
 
 class ResNet18Backbone64V(nn.Module):
     """ResNet-18 for 64x64, 支持可变 FD"""
-    def __init__(self, fd=256, internal_dim=512):
+    def __init__(self, fd=256):
         super().__init__()
         self.conv1 = nn.Conv2d(3, 64, 3, stride=1, padding=1, bias=False)
         self.bn1 = nn.BatchNorm2d(64)
         self.layer1 = self._make_layer(64, 64, 2, stride=1)
         self.layer2 = self._make_layer(64, 128, 2, stride=2)
         self.layer3 = self._make_layer(128, 256, 2, stride=2)
-        self.layer4 = self._make_layer(256, internal_dim, 2, stride=2)
+        self.layer4 = self._make_layer(256, 512, 2, stride=2)
         self.pool = nn.AdaptiveAvgPool2d(1)
-        self.fc = nn.Linear(internal_dim, fd)
+        self.fc = nn.Linear(512, fd)
 
     def _make_layer(self, ic, oc, n_blocks, stride):
         layers = [BasicBlock(ic, oc, stride)]
@@ -96,23 +86,75 @@ class ResNet18Backbone64V(nn.Module):
 
 
 # ═══════════════════════════════════════════════════════════
-# 单次实验
+# 评估函数
 # ═══════════════════════════════════════════════════════════
 
-def run_one(alpha, fd, thr, epb, epe, seed, tag):
+def evaluate(data, labels):
+    R = {}
+    R['Union'] = float((data['union_preds'] == labels).mean())
+
+    preds = expert_original(data)
+    R['Expert(min)'] = float((preds == labels).mean())
+
+    e_pred, _, _ = _get_expert_preds_and_margin(data)
+    u_correct = (data['union_preds'] == labels)
+    e_correct = (e_pred == labels)
+    R['Oracle'] = float((u_correct | e_correct).mean())
+
+    for a in [0.3, 0.5, 1.0, 2.0]:
+        for mn in [0, 10, 20]:
+            preds = cross_client_per_client_logits(data, alpha=a, min_n=mn)
+            R[f'C4 α={a} n≥{mn}'] = float((preds == labels).mean())
+
+    for wt in ['log', 'sqrt']:
+        for a in [0.3, 0.5, 1.0]:
+            preds = d1_weight_schemes(data, alpha=a, min_n=10, weight_type=wt)
+            R[f'D1 {wt} α={a}'] = float((preds == labels).mean())
+
+    best_name = max((k for k in R if k != 'Oracle'), key=R.get)
+    return R, best_name, R[best_name]
+
+
+# ═══════════════════════════════════════════════════════════
+# 主函数
+# ═══════════════════════════════════════════════════════════
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--alpha', type=float, default=0.5)
+    parser.add_argument('--fd', type=int, default=256)
+    parser.add_argument('--epb', type=int, default=300)
+    parser.add_argument('--epe', type=int, default=200)
+    parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--thrs', type=str, default='0.95,0.90,0.85,0.80',
+                        help='逗号分隔的 thr 值, 训练一次全部测试')
+    args = parser.parse_args()
+
+    thrs = [float(x) for x in args.thrs.split(',')]
+    alpha = args.alpha; fd = args.fd; seed = args.seed
+    epb = args.epb; epe = args.epe
+    NC = 5; NL = 200; LD = 32
+
     torch.manual_seed(seed); np.random.seed(seed)
     if torch.cuda.is_available(): torch.cuda.manual_seed_all(seed)
 
-    NC = 5; NL = 200; LD = 32
-
     print(f"\n{'='*70}")
-    print(f"  [{tag}] α={alpha} FD={fd} thr={thr} EPB={epb} EPE={epe} seed={seed}")
+    print(f"  Tiny-ImageNet 验证")
+    print(f"  α={alpha} FD={fd} EPB={epb} EPE={epe} seed={seed}")
+    print(f"  测试 thr: {thrs}")
     print(f"{'='*70}")
 
+    os.makedirs('results', exist_ok=True)
     etf = generate_etf(NL, fd)
     cal, ccl, tl, ccc = prepare_data_tinyimagenet(NC, alpha, NL)
 
-    # ── 训练 ──
+    # ══════════════════════════════════════════════════
+    # Phase 1: 训练 (只做一次)
+    # ══════════════════════════════════════════════════
+    print(f"\n{'='*60}")
+    print(f"  Phase 1: 训练 (FD={fd}, EPB={epb}, EPE={epe})")
+    print(f"{'='*60}")
+
     bbs = []; client_exps = []; t0 = time.time()
     for k in range(NC):
         cls = sorted(ccc[k].keys())
@@ -130,140 +172,69 @@ def run_one(alpha, fd, thr, epb, epe, seed, tag):
     tt = time.time() - t0
     print(f"\n  训练完成: {tt:.0f}s ({tt/60:.1f}min)")
 
-    # ── Filter Merge ──
-    print(f"\n  Filter Merge (thr={thr})...")
-    ubb = union_aggregate_resnet18(bbs, fd, thr, device)
-    n_params = sum(p.numel() for p in ubb.parameters())
+    # ══════════════════════════════════════════════════
+    # Phase 2: 对每个 thr 做 Filter Merge + 推理
+    # ══════════════════════════════════════════════════
+    all_results = {}
 
-    # ── 预计算 ──
-    data = precompute_all(bbs, client_exps, ubb, tl, etf, ccc, NL)
-    labels = data['labels']
+    for thr in thrs:
+        print(f"\n{'='*60}")
+        print(f"  thr={thr}: Filter Merge + 推理")
+        print(f"{'='*60}")
 
-    # ── 评估 ──
-    R = {}
-    R['Union'] = float((data['union_preds'] == labels).mean())
+        ubb = union_aggregate_resnet18(bbs, fd, thr, device)
+        n_params = sum(p.numel() for p in ubb.parameters())
 
-    preds = expert_original(data)
-    R['Expert(min)'] = float((preds == labels).mean())
+        data = precompute_all(bbs, client_exps, ubb, tl, etf, ccc, NL)
+        labels = data['labels']
 
-    e_pred, _, _ = _get_expert_preds_and_margin(data)
-    u_correct = (data['union_preds'] == labels)
-    e_correct = (e_pred == labels)
-    R['Oracle'] = float((u_correct | e_correct).mean())
+        R, best_name, best_acc = evaluate(data, labels)
 
-    # C4 + D1 (关键策略)
-    for a in [0.3, 0.5, 1.0]:
-        for mn in [0, 10, 20]:
-            preds = cross_client_per_client_logits(data, alpha=a, min_n=mn)
-            R[f'C4 α={a} n≥{mn}'] = float((preds == labels).mean())
+        print(f"    Union:    {R['Union']:.2%}")
+        print(f"    Expert:   {R['Expert(min)']:.2%}")
+        print(f"    Oracle:   {R['Oracle']:.2%}")
+        print(f"    Best:     {best_name} = {best_acc:.2%}")
+        print(f"    参数:      {n_params:,}")
 
-    for wt in ['log', 'sqrt']:
-        for a in [0.3, 0.5, 1.0]:
-            preds = d1_weight_schemes(data, alpha=a, min_n=10, weight_type=wt)
-            R[f'D1 {wt} α={a}'] = float((preds == labels).mean())
+        all_results[f'thr={thr}'] = {
+            'thr': thr, 'n_params': n_params,
+            'union': R['Union'], 'expert': R['Expert(min)'],
+            'oracle': R['Oracle'], 'best': best_acc,
+            'best_method': best_name, 'all': R,
+        }
 
-    # 找最佳非 Oracle
-    best_name = max((k for k in R if k != 'Oracle'), key=R.get)
-    best_acc = R[best_name]
+        del ubb, data
+        if torch.cuda.is_available(): torch.cuda.empty_cache()
 
-    print(f"\n  结果:")
-    print(f"    Union:      {R['Union']:.2%}")
-    print(f"    Expert:     {R['Expert(min)']:.2%}")
-    print(f"    Oracle:     {R['Oracle']:.2%}")
-    print(f"    Best:       {best_name} = {best_acc:.2%}")
-    print(f"    合并参数:    {n_params:,}")
+    # ══════════════════════════════════════════════════
+    # 汇总
+    # ══════════════════════════════════════════════════
+    print(f"\n{'='*70}")
+    print(f"  汇总: α={alpha} FD={fd} EPB={epb}")
+    print(f"{'='*70}")
+    print(f"  {'thr':>5s} | {'Union':>8s} | {'Expert':>8s} | {'Best':>8s} | {'Oracle':>8s} | {'参数':>12s} | Best method")
+    print(f"  {'-'*85}")
+    for key, r in all_results.items():
+        print(f"  {r['thr']:>5.2f} | {r['union']:>7.2%} | {r['expert']:>7.2%} | "
+              f"{r['best']:>7.2%} | {r['oracle']:>7.2%} | {r['n_params']:>12,} | {r['best_method']}")
 
-    # 保存
+    fafi = {0.05: 36.96, 0.1: 43.62, 0.3: 53.32, 0.5: 56.48}
+    if alpha in fafi:
+        print(f"\n  FAFI (α={alpha}): {fafi[alpha]:.2f}%")
+        best_ours = max(r['best'] for r in all_results.values())
+        print(f"  Ours best:     {best_ours:.2%}")
+        print(f"  差距:           {best_ours*100 - fafi[alpha]:+.2f}pp")
+
     out = {
-        'tag': tag, 'alpha': alpha, 'fd': fd, 'thr': thr,
-        'epb': epb, 'epe': epe, 'seed': seed,
-        'n_params_merged': n_params,
+        'alpha': alpha, 'fd': fd, 'epb': epb, 'epe': epe, 'seed': seed,
         'train_time': tt,
-        'results': R,
-        'best': best_name, 'best_acc': best_acc,
+        'results': all_results,
     }
+    tag = f"fd{fd}_ep{epb}_a{alpha}_s{seed}"
     out_path = f"results/verify_tiny_{tag}.json"
-    os.makedirs('results', exist_ok=True)
     with open(out_path, 'w') as f:
         json.dump(out, f, indent=2)
-    print(f"  Saved: {out_path}")
-    return out
-
-
-# ═══════════════════════════════════════════════════════════
-# 主函数
-# ═══════════════════════════════════════════════════════════
-
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--exp', type=str, default='fd',
-                        choices=['fd', 'thr', 'epoch', 'all'],
-                        help='验证哪个因素')
-    parser.add_argument('--alpha', type=float, default=0.05)
-    parser.add_argument('--fd', type=int, default=512)
-    parser.add_argument('--thr', type=float, default=0.95)
-    parser.add_argument('--epb', type=int, default=300)
-    parser.add_argument('--epe', type=int, default=200)
-    parser.add_argument('--seed', type=int, default=42)
-    args = parser.parse_args()
-
-    alpha = args.alpha; seed = args.seed
-
-    if args.exp == 'fd':
-        tag = f"fd{args.fd}_a{alpha}"
-        run_one(alpha, args.fd, 0.95, 300, 200, seed, tag)
-
-    elif args.exp == 'thr':
-        tag = f"thr{args.thr}_a{alpha}"
-        run_one(alpha, 256, args.thr, 300, 200, seed, tag)
-
-    elif args.exp == 'epoch':
-        tag = f"ep{args.epb}_a{alpha}"
-        run_one(alpha, 256, 0.95, args.epb, args.epe, seed, tag)
-
-    elif args.exp == 'all':
-        results = []
-        configs = [
-            # baseline
-            ('baseline_fd256', alpha, 256, 0.95, 300, 200),
-            # FD 验证
-            ('fd512', alpha, 512, 0.95, 300, 200),
-            # thr 验证 (用 FD=256 隔离变量)
-            ('thr090', alpha, 256, 0.90, 300, 200),
-            ('thr085', alpha, 256, 0.85, 300, 200),
-            ('thr080', alpha, 256, 0.80, 300, 200),
-            # FD=512 + 低 thr (组合)
-            ('fd512_thr085', alpha, 512, 0.85, 300, 200),
-            # epoch 验证
-            ('ep500', alpha, 256, 0.95, 500, 300),
-        ]
-        for tag, a, fd, thr, epb, epe in configs:
-            out = run_one(a, fd, thr, epb, epe, seed, tag)
-            results.append(out)
-
-        # ── 汇总表 ──
-        print(f"\n{'='*80}")
-        print(f"  汇总: Tiny-ImageNet α={alpha}")
-        print(f"{'='*80}")
-        print(f"  {'配置':<25s} | {'FD':>4s} | {'thr':>5s} | {'EPB':>4s} | {'Union':>8s} | {'Expert':>8s} | {'Best':>8s} | {'合并参数':>12s}")
-        print(f"  {'-'*95}")
-        for r in results:
-            print(f"  {r['tag']:<25s} | {r['fd']:>4d} | {r['thr']:>5.2f} | {r['epb']:>4d} | "
-                  f"{r['results']['Union']:>7.2%} | {r['results']['Expert(min)']:>7.2%} | "
-                  f"{r['best_acc']:>7.2%} | {r['n_params_merged']:>12,}")
-
-        # 保存汇总
-        summary = {r['tag']: {
-            'fd': r['fd'], 'thr': r['thr'], 'epb': r['epb'],
-            'union': r['results']['Union'],
-            'expert': r['results']['Expert(min)'],
-            'best': r['best_acc'],
-            'best_method': r['best'],
-            'n_params': r['n_params_merged'],
-        } for r in results}
-        with open(f'results/verify_tiny_summary_a{alpha}.json', 'w') as f:
-            json.dump(summary, f, indent=2)
-        print(f"\n  Summary saved: results/verify_tiny_summary_a{alpha}.json")
+    print(f"\n  Saved: {out_path}")
 
 
 if __name__ == '__main__':
