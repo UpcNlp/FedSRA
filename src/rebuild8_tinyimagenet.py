@@ -65,17 +65,15 @@ TINY_STD  = (0.2770, 0.2691, 0.2821)
 
 class TinyImageNetValDataset(Dataset):
     """Tiny-ImageNet 验证集 (需要解析 val_annotations.txt)"""
-    def __init__(self, root, transform=None):
+    def __init__(self, root, transform=None, class_to_idx=None):
         self.root = root
         self.transform = transform
         self.samples = []
         self.targets = []
 
-        # 建立 class name → index 映射
-        wnids_path = os.path.join(os.path.dirname(root), 'wnids.txt')
-        with open(wnids_path) as f:
-            wnids = [line.strip() for line in f.readlines()]
-        self.class_to_idx = {wnid: i for i, wnid in enumerate(wnids)}
+        # 必须使用训练集的 class_to_idx 保证标签一致
+        assert class_to_idx is not None, "Must pass class_to_idx from training ImageFolder"
+        self.class_to_idx = class_to_idx
 
         # 解析 val_annotations.txt
         ann_path = os.path.join(root, 'val_annotations.txt')
@@ -85,6 +83,8 @@ class TinyImageNetValDataset(Dataset):
                 fname = parts[0]
                 wnid = parts[1]
                 img_path = os.path.join(root, 'images', fname)
+                if wnid not in self.class_to_idx:
+                    continue
                 label = self.class_to_idx[wnid]
                 self.samples.append((img_path, label))
                 self.targets.append(label)
@@ -124,7 +124,8 @@ def prepare_data_tinyimagenet(n_clients=5, alpha=0.05, n_classes=200,
         f"Tiny-ImageNet not found at {data_root}. Download and extract first."
 
     train_ds = datasets.ImageFolder(train_dir, transform=tt)
-    test_ds = TinyImageNetValDataset(val_dir, transform=te)
+    test_ds = TinyImageNetValDataset(val_dir, transform=te,
+                                     class_to_idx=train_ds.class_to_idx)
 
     print(f"  Tiny-ImageNet: {len(train_ds)} train, {len(test_ds)} test, {n_classes} classes")
 
