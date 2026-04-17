@@ -144,16 +144,16 @@ def train_experts_cifar100(bb, cls_loaders, classes, etf, ccc_k,
 # 主实验
 # ═══════════════════════════════════════════════════════════
 
-def main(ALPHA=0.05, backbone_type='resnet18', SEED=42):
+def main(ALPHA=0.05, backbone_type='resnet18', SEED=42, NC=5):
     # 覆盖 rebuild8 的全局种子
     torch.manual_seed(SEED); np.random.seed(SEED)
     if torch.cuda.is_available(): torch.cuda.manual_seed_all(SEED)
 
     print("\n" + "=" * 80)
-    print(f"CIFAR-100 | Backbone: {backbone_type} | α={ALPHA} | seed={SEED}")
+    print(f"CIFAR-100 | Backbone: {backbone_type} | α={ALPHA} | seed={SEED} | K={NC}")
     print("=" * 80)
 
-    NC = 5; NL = 100; FD = 256; LD = 32
+    NL = 100; FD = 256; LD = 32
     EPB = 300; EPE = 200  # CIFAR-100: 降低 epoch
 
     os.makedirs('outputs', exist_ok=True)
@@ -339,5 +339,6 @@ if __name__ == "__main__":
     parser.add_argument('--backbone', type=str, default='resnet18',
                         choices=['cnn', 'resnet18'])
     parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--n_clients', type=int, default=5)
     args = parser.parse_args()
-    main(args.alpha, args.backbone, args.seed)
+    main(args.alpha, args.backbone, args.seed, args.n_clients)

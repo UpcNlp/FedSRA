@@ -54,16 +54,16 @@ import numpy as np
 from resnet18_filter_merge import ResNet18Backbone, union_aggregate_resnet18
 
 
-def main(ALPHA=0.05, GPU=0, SEED=42):
+def main(ALPHA=0.05, GPU=0, SEED=42, NC=5):
     # 覆盖 rebuild8 的全局种子
     torch.manual_seed(SEED); np.random.seed(SEED)
     if torch.cuda.is_available(): torch.cuda.manual_seed_all(SEED)
 
     print("\n" + "=" * 80)
-    print(f"rebuild8 + ResNet-18 Filter Merge | seed={SEED}")
+    print(f"rebuild8 + ResNet-18 Filter Merge | seed={SEED} | K={NC}")
     print("=" * 80)
 
-    NC=5; NL=10; FD=256; LD=32; EPB=600; EPE=600
+    NL=10; FD=256; LD=32; EPB=600; EPE=600
 
     os.makedirs('outputs', exist_ok=True)
     os.makedirs('results', exist_ok=True)
@@ -233,7 +233,8 @@ if __name__ == "__main__":
     parser.add_argument('--alpha', type=float, default=0.05)
     parser.add_argument('--gpu', type=int, default=0)
     parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--n_clients', type=int, default=5)
     args = parser.parse_args()
 
-    print(f"  Using GPU: {args.gpu} | seed: {args.seed}")
-    main(args.alpha, args.gpu, args.seed)
+    print(f"  Using GPU: {args.gpu} | seed: {args.seed} | K={args.n_clients}")
+    main(args.alpha, args.gpu, args.seed, args.n_clients)
