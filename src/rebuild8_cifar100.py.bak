@@ -183,7 +183,7 @@ def main(ALPHA=0.05, backbone_type='resnet18', SEED=42, NC=5):
         bb = train_bb(bb, cal[k], cls, etf, EPB)
         exps = train_experts_cifar100(bb, ccl[k], cls, etf, ccc[k],
                                        nc=NL, fdim=FD, ldim=LD, epochs=EPE)
-        bbs.append(bb.cpu()); client_exps.append({c: exp.cpu() for c, exp in exps.items()})
+        bbs.append(bb); client_exps.append(exps)
         print(f"    训练了 {len(exps)} 个 expert")
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
