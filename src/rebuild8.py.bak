@@ -317,68 +317,51 @@ def union_aggregate(bbs, fd=256, thr=0.95):
 # ═══════════════════════════════════════════════════════════
 
 def precompute_all(bbs, client_exps, union_bb, tl, etf, ccc, nc=10):
-    """内存安全版: 逐 client 计算, GPU 上只放 1 个 client 的模型"""
-    K = len(bbs); ed = etf.to(device)
+    """一次遍历测试集, 收集所有需要的信号"""
+    K = len(bbs); ed = etf.to(device); union_bb.eval()
 
-    # 构建样本量表
+    # 构建样本量表: sample_count[k][c] = 训练样本数
     sample_count = {}
     for k in range(K):
         for c in client_exps[k]:
             sample_count[(k, c)] = ccc[k].get(c, 0)
 
-    # --- Pass 1: Union logits ---
-    union_bb = union_bb.to(device); union_bb.eval()
-    all_union_logits = []; all_labels = []
-    with torch.no_grad():
-        amp = (torch.amp.autocast('cuda', dtype=torch.bfloat16) if USE_BF16
-               else torch.amp.autocast('cuda', enabled=False))
-        for x, y in tl:
-            x_dev = x.to(device, non_blocking=True)
-            with amp:
-                f_union = F.normalize(union_bb(x_dev), dim=1)
-                all_union_logits.append(torch.mm(f_union, ed.T).float().cpu())
-            all_labels.append(y)
-    union_bb = union_bb.cpu(); torch.cuda.empty_cache()
+    all_expert_errors = []   # (K, bs, nc) per batch
+    all_union_logits = []    # (bs, nc) per batch
+    all_labels = []
 
-    union_logits = torch.cat(all_union_logits, 0)
+    with torch.no_grad():
+        for x, y in tl:
+            x_dev = x.to(device, non_blocking=True); bs = x.size(0)
+
+            # Union logits
+            f_union = F.normalize(union_bb(x_dev), dim=1)
+            union_logits = torch.mm(f_union, ed.T)  # (bs, nc)
+            all_union_logits.append(union_logits.cpu())
+
+            # Expert errors
+            batch_errors = torch.full((K, bs, nc), float('inf'))
+            for k in range(K):
+                f_k = bbs[k](x_dev)
+                for c, exp in client_exps[k].items():
+                    fr, _ = exp(f_k, ed[c].unsqueeze(0).expand(bs, -1))
+                    batch_errors[k, :, c] = ((f_k - fr)**2).mean(1).cpu()
+
+            all_expert_errors.append(batch_errors)
+            all_labels.append(y)
+
+    errors = torch.cat(all_expert_errors, dim=1)    # (K, N, nc)
+    union_logits = torch.cat(all_union_logits, 0)    # (N, nc)
     labels = torch.cat(all_labels).numpy()
     N = len(labels)
 
-    # --- Pass 2: Expert errors (逐 client, 1 个 client 在 GPU) ---
-    errors = torch.full((K, N, nc), float('inf'))
-    with torch.no_grad():
-        amp = (torch.amp.autocast('cuda', dtype=torch.bfloat16) if USE_BF16
-               else torch.amp.autocast('cuda', enabled=False))
-        for k in range(K):
-            bbs[k] = bbs[k].to(device); bbs[k].eval()
-            for c in client_exps[k]:
-                client_exps[k][c] = client_exps[k][c].to(device)
-                client_exps[k][c].eval()
-
-            offset = 0
-            for x, y in tl:
-                x_dev = x.to(device, non_blocking=True); bs = x.size(0)
-                with amp:
-                    f_k = bbs[k](x_dev)
-                    for c, exp in client_exps[k].items():
-                        fr, _ = exp(f_k, ed[c].unsqueeze(0).expand(bs, -1))
-                        errors[k, offset:offset+bs, c] = ((f_k - fr)**2).mean(1).float().cpu()
-                offset += bs
-
-            bbs[k] = bbs[k].cpu()
-            for c in client_exps[k]:
-                client_exps[k][c] = client_exps[k][c].cpu()
-            torch.cuda.empty_cache()
-
-            if (k+1) % 10 == 0 or k == K-1:
-                print(f"    预计算 client {k+1}/{K} done")
-
     # Union 预测
     union_preds = union_logits.argmax(1).numpy()
+    union_margin = torch.zeros(N)
     sorted_ul, _ = union_logits.sort(dim=1, descending=True)
     union_margin = (sorted_ul[:, 0] - sorted_ul[:, 1]).numpy()
 
-    print(f"  预计算完成: {K} clients × {N} samples")
+    print(f"  预计算: {K} clients × {N} samples")
     print(f"  Union acc: {(union_preds == labels).mean():.2%}")
 
     return {
@@ -1151,8 +1134,7 @@ def main(ALPHA=0.05):
         for c in cls:
             mu, _ = compute_stats(bb, exps[c], ccl[k][c], etf[c])
             print(f"    c{c}: n={ccc[k][c]:5d} μ={mu:.6f}")
-        bbs.append(bb.cpu()); client_exps.append({c: exp.cpu() for c, exp in exps.items()})
-        torch.cuda.empty_cache()
+        bbs.append(bb); client_exps.append(exps)
     tt = time.time() - t0
     print(f"\n  训练: {tt:.1f}s")
 

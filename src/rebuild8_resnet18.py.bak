@@ -84,8 +84,7 @@ def main(ALPHA=0.05, GPU=0, SEED=42, NC=5):
         for c in cls:
             mu, _ = compute_stats(bb, exps[c], ccl[k][c], etf[c])
             print(f"    c{c}: n={ccc[k][c]:5d} μ={mu:.6f}")
-        bbs.append(bb.cpu()); client_exps.append({c: exp.cpu() for c, exp in exps.items()})
-        torch.cuda.empty_cache()
+        bbs.append(bb); client_exps.append(exps)
     tt = time.time() - t0
     print(f"\n  训练: {tt:.1f}s")
 
