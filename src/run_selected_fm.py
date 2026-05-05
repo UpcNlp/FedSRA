@@ -14,6 +14,7 @@ def save_all_models(bbs, client_exps, ccc, save_dir):
     """保存所有 client 的 backbone + experts"""
     os.makedirs(save_dir, exist_ok=True)
     for k in range(len(bbs)):
+        if bbs[k] is None: continue
         client_dir = os.path.join(save_dir, f"client_{k}")
         os.makedirs(client_dir, exist_ok=True)
         torch.save(bbs[k].state_dict(), os.path.join(client_dir, "backbone.pt"))
@@ -52,7 +53,7 @@ def select_authorities(ccc, NC, NL):
     for c in range(NL):
         best_k = -1; best_n = 0
         for k in range(NC):
-            n = ccc[k].get(c, 0)
+            n = ccc.get(k,{}).get(c, 0)
             if n > best_n:
                 best_n = n; best_k = k
         if best_k >= 0:
@@ -94,8 +95,11 @@ def main():
         bbs = []; client_exps = []
         t0 = time.time()
         for k in range(NC):
-            cls = sorted(ccc[k].keys())
-            print(f"  Client {k}: {len(cls)} cls, {sum(ccc[k].values())} samp")
+            cls = sorted(ccc.get(k,{}).keys())
+            if not cls:
+                print(f"  Client {k}: EMPTY, skipping")
+                bbs.append(None); client_exps.append({}); continue
+            print(f"  Client {k}: {len(cls)} cls, {sum(ccc.get(k,{}).values())} samp")
             bb = ResNet18Backbone(FD)
             bb = train_bb(bb, cal[k], cls, etf, EPB)
             exps = train_experts(bb, ccl[k], cls, etf, NL, FD, LD, EPE)

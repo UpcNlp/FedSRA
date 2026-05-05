@@ -50,7 +50,7 @@ if torch.cuda.is_available():
     print(f"GPU: {torch.cuda.get_device_name()}, BF16: {'ON' if USE_BF16 else 'OFF'}")
 print("=" * 80)
 
-DL_KWARGS = dict(num_workers=8, pin_memory=True, persistent_workers=True)
+DL_KWARGS = dict(num_workers=2, pin_memory=True, persistent_workers=False)
 CIFAR10_CLASSES = ['airplane','automobile','bird','cat','deer',
                    'dog','frog','horse','ship','truck']
 
@@ -94,19 +94,19 @@ def prepare_data(n_clients=5, alpha=0.05, n_classes=10):
     cidx, ccc = dirichlet_split(train_ds, n_clients, alpha, n_classes)
     print(f"\n数据分布 (α={alpha}):")
     for k in range(n_clients):
-        counts=[ccc[k].get(c,0) for c in range(n_classes)]
+        counts=[ccc.get(k,{}).get(c,0) for c in range(n_classes)]
         top=sorted(range(n_classes),key=lambda c:counts[c],reverse=True)[:3]
         print(f"  Client {k}: {sum(1 for c in counts if c>0)} cls, {sum(counts)} samp, "
               f"top: {', '.join(f'c{c}={counts[c]}' for c in top)}")
     targets = np.array(train_ds.targets)
     cal = {}
     for k in range(n_clients):
-        cal[k] = DataLoader(Subset(train_ds,cidx[k]),batch_size=128,shuffle=True,drop_last=True,**DL_KWARGS)
+        if len(cidx.get(k,[]))>0: cal[k] = DataLoader(Subset(train_ds,cidx.get(k,[])),batch_size=128,shuffle=True,drop_last=True,**DL_KWARGS)
     ccl = {}
     for k in range(n_clients):
         ccl[k] = {}
         cm = defaultdict(list)
-        for idx in cidx[k]: cm[targets[idx]].append(idx)
+        for idx in cidx.get(k,[]): cm[targets[idx]].append(idx)
         for c,idxs in cm.items():
             dl_kw = dict(num_workers=4,pin_memory=True,persistent_workers=len(idxs)>=64)
             ccl[k][c] = DataLoader(Subset(train_ds,idxs),batch_size=64,shuffle=True,drop_last=False,**dl_kw)
