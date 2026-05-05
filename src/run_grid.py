@@ -7,7 +7,7 @@ run_grid.py
 用法：
     python run_grid.py --alpha 0.05 --n_clients 5 --gpu 0
 
-结果保存到 results/grid_a{alpha}_k{n_clients}_s{seed}.json
+结果保存到 results/grid_{dataset}_a{alpha}_k{n_clients}_s{seed}.json
 """
 
 import os
@@ -33,7 +33,7 @@ warnings.filterwarnings("ignore")
 # ============================================================
 # Config
 # ============================================================
-N_CLASSES   = 10
+N_CLASSES   = 10  # default, overridden in main()
 BATCH_SIZE  = 256
 EPOCHS_CE   = 100   # CE pipeline epochs（比 SSL 少，因为 CE 收敛快）
 EPOCHS_SSL  = 200   # SSL pipeline epochs
@@ -511,7 +511,7 @@ def intrinsic_inference(ssl_models, train_datasets, test_loader, device,
 # ============================================================
 # Main experiment
 # ============================================================
-def run(alpha, n_clients, seed, gpu, pipeline="both"):
+def run(alpha, n_clients, seed, gpu, pipeline="both", dataset="cifar10"):
     seed_everything(seed)
     device = torch.device(f"cuda:{gpu}" if torch.cuda.is_available() else "cpu")
 
@@ -519,9 +519,15 @@ def run(alpha, n_clients, seed, gpu, pipeline="both"):
     print(f"  alpha={alpha}  K={n_clients}  seed={seed}  pipeline={pipeline}")
     print(f"{'='*70}")
 
-    train_base = datasets.CIFAR10("./data", train=True, download=True)
+    if dataset == "cifar100":
+        n_classes = 100
+        train_base = datasets.CIFAR100("./data", train=True, download=True)
+        test_ds    = datasets.CIFAR100("./data", train=False, transform=test_transform())
+    else:
+        n_classes = 10
+        train_base = datasets.CIFAR10("./data", train=True, download=True)
+        test_ds    = datasets.CIFAR10("./data", train=False, transform=test_transform())
     targets    = np.array(train_base.targets)
-    test_ds    = datasets.CIFAR10("./data", train=False, transform=test_transform())
     test_ldr   = DataLoader(test_ds, 256, shuffle=False, num_workers=0, pin_memory=True)
 
     # partition
@@ -549,7 +555,7 @@ def run(alpha, n_clients, seed, gpu, pipeline="both"):
     t0 = time.time()
 
     # 读取已有结果（用于部分跳过）
-    out_path = f"results/grid_a{alpha}_k{n_clients}_s{seed}.json"
+    out_path = f"results/grid_{dataset}_a{alpha}_k{n_clients}_s{seed}.json"
     existing = {}
     if os.path.exists(out_path):
         with open(out_path) as f:
@@ -627,6 +633,7 @@ def main():
     parser.add_argument("--gpu",        type=int,   default=0)
     parser.add_argument("--epochs_ce",  type=int,   default=EPOCHS_CE)
     parser.add_argument("--epochs_ssl", type=int,   default=EPOCHS_SSL)
+    parser.add_argument("--dataset", type=str, default="cifar10", choices=["cifar10","cifar100"])
     parser.add_argument("--pipeline",   type=str,   default="both",
                         choices=["both", "relational", "intrinsic"],
                         help="Which pipeline to run: both / relational / intrinsic")
@@ -634,8 +641,10 @@ def main():
 
     EPOCHS_CE  = args.epochs_ce
     EPOCHS_SSL = args.epochs_ssl
+    global N_CLASSES
+    N_CLASSES = 100 if args.dataset == "cifar100" else 10
 
-    run(args.alpha, args.n_clients, args.seed, args.gpu, args.pipeline)
+    run(args.alpha, args.n_clients, args.seed, args.gpu, args.pipeline, args.dataset)
 
 
 if __name__ == "__main__":
