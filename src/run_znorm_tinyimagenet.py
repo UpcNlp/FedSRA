@@ -10,7 +10,7 @@ znorm+sqrt(n) 主表实验 - Tiny-ImageNet
 """
 import torch, torch.nn as nn, torch.nn.functional as F
 import numpy as np, json, time, os, argparse
-from resnet18_filter_merge import ResNet18Backbone64
+from rebuild8_tinyimagenet import ResNet18Backbone64
 from rebuild8 import (generate_etf, train_bb, ConditionalExpert, device, USE_BF16,
                        cross_client_per_client_logits, expert_original)
 from rebuild8_tinyimagenet import prepare_data_tinyimagenet, train_experts_tiny
