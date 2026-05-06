@@ -49,6 +49,7 @@ def main():
     parser.add_argument('--n_clients', type=int, default=50)
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--load', action='store_true')
+    parser.add_argument('--no_save', action='store_true')
     args = parser.parse_args()
 
     ALPHA = args.alpha; NC = args.n_clients; SEED = args.seed
@@ -84,7 +85,7 @@ def main():
             client_exps.append({c: exp.cpu() for c, exp in exps.items()})
             torch.cuda.empty_cache()
         train_time = time.time() - t0
-        save_models(bbs, client_exps, ccc, save_dir)
+        if not args.no_save: save_models(bbs, client_exps, ccc, save_dir)
 
     # 评估
     ed = etf.to(device)
