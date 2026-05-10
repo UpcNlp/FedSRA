@@ -71,7 +71,6 @@ def main():
         train_time = 0
     else:
         bbs = []; client_exps = []
-        torch.cuda.reset_peak_memory_stats()
         t0 = time.time()
         for k in range(NC):
             cls = sorted(ccc.get(k, {}).keys())
@@ -86,7 +85,6 @@ def main():
             client_exps.append({c: exp.cpu() for c, exp in exps.items()})
             torch.cuda.empty_cache()
         train_time = time.time() - t0
-        gpu_peak_mb = torch.cuda.max_memory_allocated() / 1024**2
         if not args.no_save: save_models(bbs, client_exps, ccc, save_dir)
 
     # 评估
@@ -170,7 +168,6 @@ def main():
     out = {
         'method': 'znorm_sqrt', 'alpha': ALPHA, 'n_clients': NC, 'seed': SEED,
         'train_time': train_time,
-        'gpu_peak_mb': round(gpu_peak_mb, 1),
         'acc_union': float(acc_union),
         'acc_expert': float(acc_expert),
         'acc_full': {str(k): float(v) for k, v in acc_full.items()},
