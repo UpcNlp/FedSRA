@@ -9,7 +9,7 @@ from rebuild8 import (prepare_data, generate_etf, train_bb, train_experts,
                        ConditionalExpert, device, USE_BF16,
                        cross_client_per_client_logits, expert_original)
 
-DL_KWARGS = dict(num_workers=2, pin_memory=True, persistent_workers=False)
+DL_KWARGS = dict(num_workers=0, pin_memory=True, persistent_workers=False)
 
 def save_models(bbs, client_exps, ccc, save_dir):
     os.makedirs(save_dir, exist_ok=True)
@@ -79,7 +79,7 @@ def main():
                 bbs.append(None); client_exps.append({}); continue
             print(f"  Client {k}: {len(cls)} cls, {sum(ccc[k].values())} samp")
             bb = ResNet18Backbone(FD)
-            bb = train_bb(bb, cal[k], cls, etf, EPB)
+            bb = train_bb(bb, cal[k], cls, etf, EPB, save_dir=save_dir, client_id=k)
             exps = train_experts(bb, ccl[k], cls, etf, NL, FD, LD, EPE)
             bbs.append(bb.cpu())
             client_exps.append({c: exp.cpu() for c, exp in exps.items()})

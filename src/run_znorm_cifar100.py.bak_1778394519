@@ -1,21 +1,20 @@
 """
-znorm+sqrt(n) 主表实验 - Tiny-ImageNet
+znorm+sqrt(n) 主表实验 - CIFAR-100
 照搬 run_znorm_scalability.py 骨架, 改动:
-  - dataset: prepare_data → prepare_data_tinyimagenet
-  - NL: 10 → 200
-  - Backbone: ResNet18Backbone → ResNet18Backbone64 (64×64 输入)
-  - EPB / EPE: 600 → 300/200
-  - train_experts → train_experts_tiny
-  - N: 10000 (Tiny test set 大小, 200 类 × 50 张)
+  - dataset: prepare_data → prepare_data_cifar100
+  - NL: 10 → 100
+  - EPB / EPE: 600 → 300/200 (CIFAR-100 类多, 降 epoch)
+  - train_experts → train_experts_cifar100 (跳过 < 5 样本的类)
+  - N: 10000 (cifar100 test set 也是 10000)
 """
 import torch, torch.nn as nn, torch.nn.functional as F
 import numpy as np, json, time, os, argparse
-from rebuild8_tinyimagenet import ResNet18Backbone64
+from resnet18_filter_merge import ResNet18Backbone
 from rebuild8 import (generate_etf, train_bb, ConditionalExpert, device, USE_BF16,
                        cross_client_per_client_logits, expert_original)
-from rebuild8_tinyimagenet import prepare_data_tinyimagenet, train_experts_tiny
+from rebuild8_cifar100 import prepare_data_cifar100, train_experts_cifar100
 
-DL_KWARGS = dict(num_workers=0, pin_memory=True, persistent_workers=False)
+DL_KWARGS = dict(num_workers=2, pin_memory=True, persistent_workers=False)
 
 
 def save_models(bbs, client_exps, ccc, save_dir):
@@ -37,7 +36,7 @@ def load_models(save_dir, NC, NL, FD=256):
         cd = os.path.join(save_dir, f"client_{k}")
         if not os.path.exists(cd):
             bbs.append(None); client_exps.append({}); continue
-        bb = ResNet18Backbone64(FD)
+        bb = ResNet18Backbone(FD)
         bb.load_state_dict(torch.load(f"{cd}/backbone.pt", map_location='cpu', weights_only=True))
         bbs.append(bb)
         exps = {}
@@ -62,17 +61,17 @@ def main():
     args = parser.parse_args()
 
     ALPHA = args.alpha; NC = args.n_clients; SEED = args.seed
-    NL = 200; FD = 256; LD = 32; EPB = 300; EPE = 200  # Tiny
+    NL = 100; FD = 256; LD = 32; EPB = 300; EPE = 200  # CIFAR-100
     torch.manual_seed(SEED); np.random.seed(SEED)
 
-    save_dir = f"saved_models/tiny_a{ALPHA}_k{NC}_s{SEED}"
+    save_dir = f"saved_models/cifar100_a{ALPHA}_k{NC}_s{SEED}"
 
     print(f"\n{'='*60}")
-    print(f"  znorm Tiny-ImageNet: α={ALPHA}, K={NC}, seed={SEED}")
+    print(f"  znorm CIFAR-100: α={ALPHA}, K={NC}, seed={SEED}")
     print(f"{'='*60}")
 
     etf = generate_etf(NL, FD)
-    cal, ccl, tl, ccc = prepare_data_tinyimagenet(NC, ALPHA, NL)
+    cal, ccl, tl, ccc = prepare_data_cifar100(NC, ALPHA, NL)
 
     if args.load and os.path.exists(save_dir):
         bbs, client_exps, ccc = load_models(save_dir, NC, NL, FD)
@@ -88,10 +87,10 @@ def main():
                 bbs.append(None); client_exps.append({}); continue
             n_samp = sum(ccc[k].values())
             print(f"\n  Client {k}: {len(cls)}/{NL} cls, {n_samp} samp")
-            bb = ResNet18Backbone64(FD)
+            bb = ResNet18Backbone(FD)
             bb = train_bb(bb, cal[k], cls, etf, EPB)
-            exps = train_experts_tiny(bb, ccl[k], cls, etf, ccc[k],
-                                       nc=NL, fdim=FD, ldim=LD, epochs=EPE)
+            exps = train_experts_cifar100(bb, ccl[k], cls, etf, ccc[k],
+                                           nc=NL, fdim=FD, ldim=LD, epochs=EPE)
             bbs.append(bb.cpu())
             client_exps.append({c: exp.cpu() for c, exp in exps.items()})
             torch.cuda.empty_cache()
@@ -100,8 +99,7 @@ def main():
 
     # 评估
     ed = etf.to(device)
-    # Tiny test: 200 classes × 50 imgs = 10000
-    N = 10000
+    N = 10000  # CIFAR-100 test set 也是 10000
     all_raw = []; all_labels = []
     errors = torch.full((NC, N, NL), float('inf'))
 
@@ -178,7 +176,7 @@ def main():
 
     os.makedirs('results', exist_ok=True)
     out = {
-        'method': 'znorm_sqrt', 'dataset': 'Tiny-ImageNet',
+        'method': 'znorm_sqrt', 'dataset': 'CIFAR-100',
         'alpha': ALPHA, 'n_clients': NC, 'seed': SEED,
         'train_time': train_time,
         'acc_union': float(acc_union),
@@ -187,7 +185,7 @@ def main():
         'best_alpha': float(best_a),
         'best_acc': float(best_full),
     }
-    path = f"results/znorm_tiny_a{ALPHA}_k{NC}_s{SEED}.json"
+    path = f"results/znorm_cifar100_a{ALPHA}_k{NC}_s{SEED}.json"
     json.dump(out, open(path, 'w'), indent=2)
     print(f"  Saved: {path}")
 
