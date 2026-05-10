@@ -14,7 +14,7 @@ from rebuild8 import (generate_etf, train_bb, ConditionalExpert, device, USE_BF1
                        cross_client_per_client_logits, expert_original)
 from rebuild8_cifar100 import prepare_data_cifar100, train_experts_cifar100
 
-DL_KWARGS = dict(num_workers=2, pin_memory=True, persistent_workers=False)
+DL_KWARGS = dict(num_workers=0, pin_memory=True, persistent_workers=False)
 
 
 def save_models(bbs, client_exps, ccc, save_dir):

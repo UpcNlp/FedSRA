@@ -161,7 +161,7 @@ def prepare_data_tinyimagenet(n_clients=5, alpha=0.05, n_classes=200,
     for k in range(n_clients):
         cal[k] = DataLoader(Subset(train_ds, cidx[k]), batch_size=128,
                             shuffle=True, drop_last=True,
-                            num_workers=4, pin_memory=True)
+                            num_workers=0, pin_memory=True)
     ccl = {}
     for k in range(n_clients):
         ccl[k] = {}
@@ -172,7 +172,7 @@ def prepare_data_tinyimagenet(n_clients=5, alpha=0.05, n_classes=200,
                                    shuffle=True, drop_last=False,
                                    num_workers=0, pin_memory=True)
     tl = DataLoader(test_ds, batch_size=256, shuffle=False,
-                    num_workers=4, pin_memory=True)
+                    num_workers=0, pin_memory=True)
     return cal, ccl, tl, ccc
 
 

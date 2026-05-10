@@ -50,7 +50,7 @@ if torch.cuda.is_available():
     print(f"GPU: {torch.cuda.get_device_name()}, BF16: {'ON' if USE_BF16 else 'OFF'}")
 print("=" * 80)
 
-DL_KWARGS = dict(num_workers=0, pin_memory=True, persistent_workers=False)
+DL_KWARGS = dict(num_workers=2, pin_memory=True, persistent_workers=False)
 CIFAR10_CLASSES = ['airplane','automobile','bird','cat','deer',
                    'dog','frog','horse','ship','truck']
 
@@ -108,7 +108,7 @@ def prepare_data(n_clients=5, alpha=0.05, n_classes=10):
         cm = defaultdict(list)
         for idx in cidx.get(k,[]): cm[targets[idx]].append(idx)
         for c,idxs in cm.items():
-            dl_kw = dict(num_workers=0,pin_memory=True,persistent_workers=False)
+            dl_kw = dict(num_workers=4,pin_memory=True,persistent_workers=len(idxs)>=64)
             ccl[k][c] = DataLoader(Subset(train_ds,idxs),batch_size=64,shuffle=True,drop_last=False,**dl_kw)
     tl = DataLoader(test_ds,batch_size=256,shuffle=False,**DL_KWARGS)
     return cal, ccl, tl, ccc
