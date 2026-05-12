@@ -57,12 +57,7 @@ def precompute_with_union(bbs, client_exps, tl, etf, ccc, nc, union_method='znor
         with torch.no_grad():
             for x, y in tl:
                 x = x.to(device); bs = x.size(0)
-                # raw features (不 normalize) — 跟 run_znorm_scalability.py 一致
-                xx = F.relu(bbs[k].bn1(bbs[k].conv1(x)))
-                xx = bbs[k].layer1(xx); xx = bbs[k].layer2(xx)
-                xx = bbs[k].layer3(xx); xx = bbs[k].layer4(xx)
-                xx = bbs[k].pool(xx).flatten(1)
-                feat = bbs[k].fc(xx)
+                feat = bbs[k](x)
                 feats.append(feat.cpu())
                 f_norm = F.normalize(feat, dim=1)
                 for c, exp in client_exps[k].items():
