@@ -17,11 +17,10 @@ C4 的成功关键: 保留 per-client 结构, 分别 normalize, 加权融合
 运行: python moe_v15_deep_ensemble.py
 """
 
-import sys, torch
+import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Subset
-from tqdm import tqdm
 from torchvision import datasets, transforms
 import numpy as np
 import warnings
@@ -174,8 +173,7 @@ def train_bb(bb,loader,classes,etf,epochs=600,lr=1e-3,save_dir=None,client_id=No
     amp=(torch.amp.autocast('cuda',dtype=torch.bfloat16) if USE_BF16
          else torch.amp.autocast('cuda',enabled=False))
     bb_ckpts = {}
-    pbar = tqdm(range(epochs), desc=f"  BB c{client_id}", ncols=100, mininterval=10.0, file=sys.stdout)
-    for ep in pbar:
+    for ep in range(epochs):
         el=0;nb=0
         for x,y in loader:
             x=x.to(device,non_blocking=True);y=y.to(device,non_blocking=True)
@@ -186,7 +184,6 @@ def train_bb(bb,loader,classes,etf,epochs=600,lr=1e-3,save_dir=None,client_id=No
             opt.zero_grad(set_to_none=True);loss.backward();opt.step();el+=loss.item();nb+=1
         sch.step()
         ep_num = ep + 1
-        pbar.set_postfix(loss=f"{el/max(nb,1):.3f}")
         if ep_num % save_every == 0:
             bb_ckpts[ep_num] = _copy.deepcopy(bb.cpu().state_dict())
             bb.to(device)
@@ -194,7 +191,7 @@ def train_bb(bb,loader,classes,etf,epochs=600,lr=1e-3,save_dir=None,client_id=No
                 sd = os.path.join(save_dir, f'client_{client_id}')
                 os.makedirs(sd, exist_ok=True)
                 torch.save(bb_ckpts[ep_num], os.path.join(sd, f'bb_ep{ep_num}.pt'))
-    pbar.close()
+        if ep_num % 100 == 0 or ep == 0: print(f"      BB {ep_num}/{epochs} loss={el/max(nb,1):.4f}")
     bb.bb_ckpts = bb_ckpts
     return bb
 
