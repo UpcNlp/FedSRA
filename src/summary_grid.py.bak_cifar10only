@@ -33,7 +33,7 @@ warnings.filterwarnings("ignore")
 # ============================================================
 # Config
 # ============================================================
-N_CLASSES   = 10  # will be overridden by --dataset
+N_CLASSES   = 10
 BATCH_SIZE  = 256
 EPOCHS_CE   = 100   # CE pipeline epochs（比 SSL 少，因为 CE 收敛快）
 EPOCHS_SSL  = 200   # SSL pipeline epochs
@@ -493,7 +493,7 @@ def intrinsic_inference(ssl_models, train_datasets, test_loader, device,
 # ============================================================
 # Main experiment
 # ============================================================
-def run(alpha, n_clients, seed, gpu, dataset="cifar10"):
+def run(alpha, n_clients, seed, gpu):
     seed_everything(seed)
     device = torch.device(f"cuda:{gpu}" if torch.cuda.is_available() else "cpu")
 
@@ -501,16 +501,9 @@ def run(alpha, n_clients, seed, gpu, dataset="cifar10"):
     print(f"  alpha={alpha}  K={n_clients}  seed={seed}")
     print(f"{'='*70}")
 
-    global N_CLASSES
-    if dataset == "cifar100":
-        N_CLASSES = 100
-        train_base = datasets.CIFAR100("./data", train=True, download=True)
-        test_ds    = datasets.CIFAR100("./data", train=False, transform=test_transform())
-    else:
-        N_CLASSES = 10
-        train_base = datasets.CIFAR10("./data", train=True, download=True)
-        test_ds    = datasets.CIFAR10("./data", train=False, transform=test_transform())
+    train_base = datasets.CIFAR10("./data", train=True, download=True)
     targets    = np.array(train_base.targets)
+    test_ds    = datasets.CIFAR10("./data", train=False, transform=test_transform())
     test_ldr   = DataLoader(test_ds, 256, shuffle=False, num_workers=4, pin_memory=True)
 
     # partition
@@ -564,7 +557,6 @@ def run(alpha, n_clients, seed, gpu, dataset="cifar10"):
     # ── Save ─────────────────────────────────────────────────
     os.makedirs("results", exist_ok=True)
     out = {
-        "dataset":     dataset,
         "alpha":       alpha,
         "n_clients":   n_clients,
         "seed":        seed,
@@ -575,8 +567,7 @@ def run(alpha, n_clients, seed, gpu, dataset="cifar10"):
         "epochs_ce":   EPOCHS_CE,
         "epochs_ssl":  EPOCHS_SSL,
     }
-    prefix = f"{dataset}_" if dataset != "cifar10" else ""
-    path = f"results/grid_{prefix}a{alpha}_k{n_clients}_s{seed}.json"
+    path = f"results/grid_a{alpha}_k{n_clients}_s{seed}.json"
     with open(path, "w") as f:
         json.dump(out, f, indent=2)
 
@@ -593,14 +584,15 @@ def main():
     parser.add_argument("--n_clients", type=int,   default=5)
     parser.add_argument("--seed",      type=int,   default=42)
     parser.add_argument("--gpu",       type=int,   default=0)
-    parser.add_argument("--dataset",   type=str,   default="cifar10", choices=["cifar10","cifar100"])
-    parser.add_argument("--epochs_ce", type=int,   default=100)
-    parser.add_argument("--epochs_ssl",type=int,   default=200)
+    parser.add_argument("--epochs_ce", type=int,   default=EPOCHS_CE)
+    parser.add_argument("--epochs_ssl",type=int,   default=EPOCHS_SSL)
     args = parser.parse_args()
-    import summary_grid as _m
-    _m.EPOCHS_CE = args.epochs_ce
-    _m.EPOCHS_SSL = args.epochs_ssl
-    run(args.alpha, args.n_clients, args.seed, args.gpu, args.dataset)
+
+    global EPOCHS_CE, EPOCHS_SSL
+    EPOCHS_CE  = args.epochs_ce
+    EPOCHS_SSL = args.epochs_ssl
+
+    run(args.alpha, args.n_clients, args.seed, args.gpu)
 
 
 if __name__ == "__main__":
