@@ -140,7 +140,7 @@ def evaluate_configs_v2(bbs, client_exps, tl, etf, ccc, nc):
 
     # ─── C: Rel + Expert (client avg) ───
     best_acc = 0; best_cfg = ''
-    for a in [0.05, 0.1, 0.2, 0.3, 0.5, 1.0]:
+    for a in [0.3, 0.5, 1.0]:
         for mn in [0, 10]:
             preds = cross_client_per_client_logits(data_avg, alpha=a, min_n=mn)
             acc = float((preds == labels).mean())
@@ -154,22 +154,13 @@ def evaluate_configs_v2(bbs, client_exps, tl, etf, ccc, nc):
 
     # ─── F: Full (znorm + Expert + Fusion, Ours) ───
     best_acc = 0; best_cfg = ''
-    for a in [0.05, 0.1, 0.2, 0.3, 0.5, 1.0]:
+    for a in [0.3, 0.5, 1.0]:
         for mn in [0, 10]:
             preds = cross_client_per_client_logits(data_znorm, alpha=a, min_n=mn)
             acc = float((preds == labels).mean())
             if acc > best_acc: best_acc = acc; best_cfg = f'α={a} n>={mn}'
     results['F_full_ours'] = best_acc
     results['F_full_ours_cfg'] = best_cfg
-    # ─── F_dynamic: 动态 αf = 0.2 * avg_coverage ───
-    coverage = np.zeros(nc)
-    for c in range(nc):
-        coverage[c] = sum(1 for k in range(NC) if ccc.get(k, {}).get(c, 0) >= 10) / NC
-    af_dynamic = 0.2 * coverage.mean()
-    preds_dyn = cross_client_per_client_logits(data_znorm, alpha=af_dynamic, min_n=10)
-    results['F_dynamic'] = float((preds_dyn == labels).mean())
-    results['F_dynamic_af'] = round(af_dynamic, 4)
-    results['F_dynamic_cov'] = round(float(coverage.mean()), 4)
 
     return results
 
@@ -214,19 +205,6 @@ def main():
             exps = train_experts_cifar100(bb, ccl[k], cls, etf, ccc[k], NL, FD, LD, EPE)
         bbs.append(bb); client_exps.append(exps)
         if torch.cuda.is_available(): torch.cuda.empty_cache()
-
-    # ── 保存模型权重 ──
-    save_dir = f"saved_models/ablation_{args.dataset}_a{args.alpha}_k{NC}_s{args.seed}"
-    os.makedirs(save_dir, exist_ok=True)
-    for k in range(NC):
-        cd_ = os.path.join(save_dir, f"client_{k}")
-        os.makedirs(cd_, exist_ok=True)
-        torch.save(bbs[k].state_dict(), os.path.join(cd_, "backbone.pt"))
-        for c, exp in client_exps[k].items():
-            torch.save(exp.state_dict(), os.path.join(cd_, f"expert_{c}.pt"))
-    torch.save(dict(ccc), os.path.join(save_dir, "ccc.pt"))
-    print(f"  模型已保存到 {save_dir}")
-
     tt = time.time() - t0
     print(f"训练耗时: {tt:.0f}s")
 
