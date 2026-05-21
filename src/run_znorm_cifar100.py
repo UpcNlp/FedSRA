@@ -73,6 +73,7 @@ def main():
     etf = generate_etf(NL, FD)
     cal, ccl, tl, ccc = prepare_data_cifar100(NC, ALPHA, NL)
 
+    gpu_peak_mb = 0.0  # default for --load mode
     if args.load and os.path.exists(save_dir):
         bbs, client_exps, ccc = load_models(save_dir, NC, NL, FD)
         print(f"  Loaded {sum(1 for b in bbs if b is not None)}/{NC} clients")
@@ -160,10 +161,17 @@ def main():
     }
     acc_expert = (expert_original(data) == labels).mean()
     acc_full = {}
-    for a in [0.3, 0.5, 1.0]:
+    for a in [0.05, 0.1, 0.2, 0.3, 0.5, 1.0]:
         acc_full[a] = (cross_client_per_client_logits(data, alpha=a, min_n=10) == labels).mean()
     best_a = max(acc_full, key=acc_full.get)
     best_full = acc_full[best_a]
+
+    # 动态 αf = 0.2 * avg_coverage
+    coverage = np.zeros(NL)
+    for c in range(NL):
+        coverage[c] = sum(1 for k in range(NC) if ccc.get(k, {}).get(c, 0) >= 10) / NC
+    af_dynamic = 0.2 * coverage.mean()
+    acc_dynamic = (cross_client_per_client_logits(data, alpha=af_dynamic, min_n=10) == labels).mean()
 
     print(f"\n{'='*60}")
     print(f"  Results: α={ALPHA}, K={NC}, seed={SEED}")
@@ -184,6 +192,9 @@ def main():
         'acc_full': {str(k): float(v) for k, v in acc_full.items()},
         'best_alpha': float(best_a),
         'best_acc': float(best_full),
+        'acc_dynamic': float(acc_dynamic),
+        'af_dynamic': round(float(af_dynamic), 4),
+        'avg_coverage': round(float(coverage.mean()), 4),
     }
     path = f"results/znorm_cifar100_a{ALPHA}_k{NC}_s{SEED}.json"
     json.dump(out, open(path, 'w'), indent=2)

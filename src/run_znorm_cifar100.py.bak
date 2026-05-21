@@ -1,15 +1,21 @@
 """
-Scalability 实验: znorm+sqrt(n) 聚合
-训练 + 保存模型 + 评估
+znorm+sqrt(n) 主表实验 - CIFAR-100
+照搬 run_znorm_scalability.py 骨架, 改动:
+  - dataset: prepare_data → prepare_data_cifar100
+  - NL: 10 → 100
+  - EPB / EPE: 600 → 300/200 (CIFAR-100 类多, 降 epoch)
+  - train_experts → train_experts_cifar100 (跳过 < 5 样本的类)
+  - N: 10000 (cifar100 test set 也是 10000)
 """
 import torch, torch.nn as nn, torch.nn.functional as F
 import numpy as np, json, time, os, argparse
 from resnet18_filter_merge import ResNet18Backbone
-from rebuild8 import (prepare_data, generate_etf, train_bb, train_experts,
-                       ConditionalExpert, device, USE_BF16,
+from rebuild8 import (generate_etf, train_bb, ConditionalExpert, device, USE_BF16,
                        cross_client_per_client_logits, expert_original)
+from rebuild8_cifar100 import prepare_data_cifar100, train_experts_cifar100
 
 DL_KWARGS = dict(num_workers=0, pin_memory=True, persistent_workers=False)
+
 
 def save_models(bbs, client_exps, ccc, save_dir):
     os.makedirs(save_dir, exist_ok=True)
@@ -22,6 +28,7 @@ def save_models(bbs, client_exps, ccc, save_dir):
             torch.save(exp.state_dict(), os.path.join(cd, f"expert_{c}.pt"))
     torch.save(dict(ccc), os.path.join(save_dir, "ccc.pt"))
     print(f"  模型已保存到 {save_dir}")
+
 
 def load_models(save_dir, NC, NL, FD=256):
     bbs = []; client_exps = []
@@ -43,27 +50,28 @@ def load_models(save_dir, NC, NL, FD=256):
     ccc = torch.load(os.path.join(save_dir, "ccc.pt"), weights_only=False)
     return bbs, client_exps, ccc
 
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--alpha', type=float, default=0.05)
-    parser.add_argument('--n_clients', type=int, default=50)
+    parser.add_argument('--n_clients', type=int, default=5)
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--load', action='store_true')
     parser.add_argument('--no_save', action='store_true')
     args = parser.parse_args()
 
     ALPHA = args.alpha; NC = args.n_clients; SEED = args.seed
-    NL = 10; FD = 256; LD = 32; EPB = 600; EPE = 600
+    NL = 100; FD = 256; LD = 32; EPB = 300; EPE = 200  # CIFAR-100
     torch.manual_seed(SEED); np.random.seed(SEED)
 
-    save_dir = f"saved_models/a{ALPHA}_k{NC}_s{SEED}"
+    save_dir = f"saved_models/cifar100_a{ALPHA}_k{NC}_s{SEED}"
 
     print(f"\n{'='*60}")
-    print(f"  znorm Scalability: α={ALPHA}, K={NC}, seed={SEED}")
+    print(f"  znorm CIFAR-100: α={ALPHA}, K={NC}, seed={SEED}")
     print(f"{'='*60}")
 
     etf = generate_etf(NL, FD)
-    cal, ccl, tl, ccc = prepare_data(NC, ALPHA, NL)
+    cal, ccl, tl, ccc = prepare_data_cifar100(NC, ALPHA, NL)
 
     if args.load and os.path.exists(save_dir):
         bbs, client_exps, ccc = load_models(save_dir, NC, NL, FD)
@@ -71,27 +79,27 @@ def main():
         train_time = 0
     else:
         bbs = []; client_exps = []
-        torch.cuda.reset_peak_memory_stats()
         t0 = time.time()
         for k in range(NC):
             cls = sorted(ccc.get(k, {}).keys())
             if not cls:
                 print(f"  Client {k}: EMPTY")
                 bbs.append(None); client_exps.append({}); continue
-            print(f"  Client {k}: {len(cls)} cls, {sum(ccc[k].values())} samp")
+            n_samp = sum(ccc[k].values())
+            print(f"\n  Client {k}: {len(cls)}/{NL} cls, {n_samp} samp")
             bb = ResNet18Backbone(FD)
-            bb = train_bb(bb, cal[k], cls, etf, EPB, save_dir=save_dir, client_id=k)
-            exps = train_experts(bb, ccl[k], cls, etf, NL, FD, LD, EPE)
+            bb = train_bb(bb, cal[k], cls, etf, EPB)
+            exps = train_experts_cifar100(bb, ccl[k], cls, etf, ccc[k],
+                                           nc=NL, fdim=FD, ldim=LD, epochs=EPE)
             bbs.append(bb.cpu())
             client_exps.append({c: exp.cpu() for c, exp in exps.items()})
             torch.cuda.empty_cache()
         train_time = time.time() - t0
-        gpu_peak_mb = torch.cuda.max_memory_allocated() / 1024**2
         if not args.no_save: save_models(bbs, client_exps, ccc, save_dir)
 
     # 评估
     ed = etf.to(device)
-    N = 10000
+    N = 10000  # CIFAR-100 test set 也是 10000
     all_raw = []; all_labels = []
     errors = torch.full((NC, N, NL), float('inf'))
 
@@ -120,7 +128,7 @@ def main():
         bbs[k] = bbs[k].cpu()
         for c in client_exps[k]: client_exps[k][c] = client_exps[k][c].cpu()
         torch.cuda.empty_cache()
-        if (k+1) % 10 == 0: print(f"    eval {k+1}/{NC}")
+        if (k+1) % 5 == 0: print(f"    eval {k+1}/{NC}")
     labels = torch.cat(all_labels).numpy()
 
     sample_count = {}
@@ -158,7 +166,7 @@ def main():
     best_full = acc_full[best_a]
 
     print(f"\n{'='*60}")
-    print(f"  Results: α={ALPHA}, K={NC}")
+    print(f"  Results: α={ALPHA}, K={NC}, seed={SEED}")
     print(f"{'='*60}")
     print(f"  znorm+sqrt(n) union:  {acc_union*100:.2f}%")
     print(f"  Expert only:          {acc_expert*100:.2f}%")
@@ -168,18 +176,19 @@ def main():
 
     os.makedirs('results', exist_ok=True)
     out = {
-        'method': 'znorm_sqrt', 'alpha': ALPHA, 'n_clients': NC, 'seed': SEED,
+        'method': 'znorm_sqrt', 'dataset': 'CIFAR-100',
+        'alpha': ALPHA, 'n_clients': NC, 'seed': SEED,
         'train_time': train_time,
-        'gpu_peak_mb': round(gpu_peak_mb, 1),
         'acc_union': float(acc_union),
         'acc_expert': float(acc_expert),
         'acc_full': {str(k): float(v) for k, v in acc_full.items()},
         'best_alpha': float(best_a),
         'best_acc': float(best_full),
     }
-    path = f"results/znorm_scale_a{ALPHA}_k{NC}_s{SEED}.json"
+    path = f"results/znorm_cifar100_a{ALPHA}_k{NC}_s{SEED}.json"
     json.dump(out, open(path, 'w'), indent=2)
     print(f"  Saved: {path}")
+
 
 if __name__ == '__main__':
     main()
