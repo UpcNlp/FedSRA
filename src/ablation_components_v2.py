@@ -182,6 +182,7 @@ def evaluate_configs_v2(bbs, client_exps, tl, etf, ccc, nc):
             if acc > best_acc: best_acc = acc; best_cfg = f'α={a} n>={mn}'
     results['F_full_ours'] = best_acc
     results['F_full_ours_cfg'] = best_cfg
+    NC = len(bbs)
     # ─── F_dynamic: 动态 αf = 0.2 * avg_coverage ───
     coverage = np.zeros(nc)
     for c in range(nc):
