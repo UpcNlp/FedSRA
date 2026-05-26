@@ -1,0 +1,11 @@
+{
+  "alpha": 0.1,
+  "n_clients": 50,
+  "seed": 42,
+  "acc_relational": null,
+  "acc_intrinsic": 0.5025,
+  "gap": null,
+  "time_total": 44871.44133234024,
+  "epochs_ce": 100,
+  "epochs_ssl": 200
+}
