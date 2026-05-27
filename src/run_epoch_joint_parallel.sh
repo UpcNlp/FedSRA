@@ -9,6 +9,7 @@ set -u
 cd "$(dirname "$0")"
 mkdir -p logs
 
+PY=${PY:-/public/home/dongshou/anaconda/envs/ct/bin/python}
 SEED=42
 NC=10
 MAX_EP=600
@@ -18,7 +19,7 @@ run() {
     local gpu=$1; local alpha=$2
     echo "[GPU$gpu] α=$alpha → logs/joint_a${alpha}_k${NC}.log"
     HIP_VISIBLE_DEVICES=$gpu CUDA_VISIBLE_DEVICES=$gpu \
-        python -u run_epoch_analysis_joint.py \
+        $PY -u run_epoch_analysis_joint.py \
             --alpha $alpha --seed $SEED --n_clients $NC \
             --max_ep $MAX_EP --snapshots "$SNAPS" \
             > logs/joint_a${alpha}_k${NC}.log 2>&1 &
