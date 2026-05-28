@@ -51,7 +51,7 @@ if torch.cuda.is_available():
     print(f"GPU: {torch.cuda.get_device_name()}, BF16: {'ON' if USE_BF16 else 'OFF'}")
 print("=" * 80)
 
-DL_KWARGS = dict(num_workers=0, pin_memory=True, persistent_workers=False)
+DL_KWARGS = dict(num_workers=4, pin_memory=True, persistent_workers=True)
 CIFAR10_CLASSES = ['airplane','automobile','bird','cat','deer',
                    'dog','frog','horse','ship','truck']
 
@@ -166,29 +166,57 @@ def etf_al(features,labels,etf):
     features=F.normalize(features,dim=1)
     return (1-(features*etf[labels]).sum(1)).mean()
 
-def train_bb(bb,loader,classes,etf,epochs=600,lr=1e-3,save_dir=None,client_id=None,save_every=20):
+def train_bb(bb,loader,classes,etf,epochs=600,lr=1e-3,save_dir=None,client_id=None,
+             save_every=20, save_at_epochs=None, save_fp16=True, loss_type='J'):
+    """
+    save_at_epochs: optional list/set of specific epoch numbers to snapshot.
+                    If provided, save_every is ignored.
+    save_fp16:      cast snapshot to fp16 to halve disk footprint (eval-only use).
+    loss_type:      ablation backbone training loss
+                      'J' = etf_cl + 0.5*etf_al  (default; joint = NC1+NC2, current behavior)
+                      'R' = etf_cl only           (relational only; NC2)
+                                                  Falls back to etf_al when ncl<2 (etf_cl undefined).
+                      'I' = etf_al only           (intrinsic only; NC1)
+    """
     import os,copy as _copy
+    assert loss_type in ('J', 'R', 'I'), f"loss_type must be one of J/R/I, got {loss_type}"
     bb=bb.to(device);ed=etf.to(device);ncl=len(classes);bb.train()
     opt=torch.optim.Adam(bb.parameters(),lr=lr)
     sch=torch.optim.lr_scheduler.CosineAnnealingLR(opt,T_max=epochs)
     amp=(torch.amp.autocast('cuda',dtype=torch.bfloat16) if USE_BF16
          else torch.amp.autocast('cuda',enabled=False))
     bb_ckpts = {}
-    pbar = tqdm(range(epochs), desc=f"  BB c{client_id}", ncols=100, mininterval=10.0, file=sys.stdout)
+    snap_set = set(save_at_epochs) if save_at_epochs else None
+    # Track whether this client's R-only training degenerated to etf_al due to ncl<2
+    r_fallback = (loss_type == 'R' and ncl < 2)
+    pbar = tqdm(range(epochs), desc=f"  BB c{client_id}[{loss_type}{'*' if r_fallback else ''}]",
+                ncols=100, mininterval=10.0, file=sys.stdout)
     for ep in pbar:
         el=0;nb=0
         for x,y in loader:
             x=x.to(device,non_blocking=True);y=y.to(device,non_blocking=True)
             with amp:
                 f=bb(x)
-                if ncl>=2: loss=etf_cl(f,y,ed)+0.5*etf_al(f,y,ed)
-                else: loss=etf_al(f,y,ed)
+                if loss_type == 'J':
+                    if ncl>=2: loss=etf_cl(f,y,ed)+0.5*etf_al(f,y,ed)
+                    else:      loss=etf_al(f,y,ed)
+                elif loss_type == 'R':
+                    if ncl>=2: loss=etf_cl(f,y,ed)
+                    else:      loss=etf_al(f,y,ed)   # forced fallback
+                else:  # 'I'
+                    loss=etf_al(f,y,ed)
             opt.zero_grad(set_to_none=True);loss.backward();opt.step();el+=loss.item();nb+=1
         sch.step()
         ep_num = ep + 1
         pbar.set_postfix(loss=f"{el/max(nb,1):.3f}")
-        if ep_num % save_every == 0:
-            bb_ckpts[ep_num] = _copy.deepcopy(bb.cpu().state_dict())
+        should_snap = (snap_set is not None and ep_num in snap_set) \
+                      or (snap_set is None and ep_num % save_every == 0)
+        if should_snap:
+            sd_full = bb.cpu().state_dict()
+            if save_fp16:
+                sd_full = {k: (v.half() if v.is_floating_point() else v)
+                           for k, v in sd_full.items()}
+            bb_ckpts[ep_num] = _copy.deepcopy(sd_full)
             bb.to(device)
             if save_dir and client_id is not None:
                 sd = os.path.join(save_dir, f'client_{client_id}')
