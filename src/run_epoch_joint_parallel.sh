@@ -12,8 +12,9 @@ mkdir -p logs
 PY=${PY:-/public/home/dongshou/anaconda/envs/ct/bin/python}
 SEED=42
 NC=10
-MAX_EP=600
-SNAPS="10,20,30,50,75,100,150,200,250,300,400,500,600"
+MAX_EP=700
+COSINE_END=600                                    # 1..600 用 cosine (匹配旧 run), 601..700 切常量微调 LR
+SNAPS="1,2,3,5,7,10,15,20,30,50,75,100,150,200,300,400,500,600,650,700"
 
 run() {
     local gpu=$1; local alpha=$2
@@ -21,7 +22,7 @@ run() {
     HIP_VISIBLE_DEVICES=$gpu CUDA_VISIBLE_DEVICES=$gpu \
         $PY -u run_epoch_analysis_joint.py \
             --alpha $alpha --seed $SEED --n_clients $NC \
-            --max_ep $MAX_EP --snapshots "$SNAPS" \
+            --max_ep $MAX_EP --cosine_end_ep $COSINE_END --snapshots "$SNAPS" \
             > logs/joint_a${alpha}_k${NC}.log 2>&1 &
 }
 

@@ -34,20 +34,36 @@ from rebuild8 import (
 from shared_expert import SharedConditionalExpert, shared_expert_loss
 
 
+def _piecewise_lr(ep, lr_init, cosine_end, const_factor=0.01):
+    """ep<cosine_end: cosine 衰减到 0; ep>=cosine_end: 常量 const_factor*lr_init (微调段)。
+
+    保证 ep<=cosine_end 时与 CosineAnnealingLR(T_max=cosine_end) 完全等价 →
+    旧 run 的 ep 1..cosine_end 数据可复现。
+    """
+    import math
+    if ep < cosine_end:
+        return lr_init * (1 + math.cos(math.pi * ep / cosine_end)) / 2
+    return lr_init * const_factor
+
+
 def train_joint(bb, expert, loader, classes, etf, max_epochs, snapshot_epochs,
-                lr_bb=1e-3, lr_exp=1e-3, NL=10, FD=256, client_id=None):
+                lr_bb=1e-3, lr_exp=1e-3, NL=10, FD=256, client_id=None,
+                cosine_end_ep=None, lr_const_factor=0.01):
     """单阶段: BB (ETF loss) + 共享 expert (重构+排斥 loss, detach feat 不污染 BB)。
 
-    两个独立 optimizer + cosine schedule, 互不干扰。
-    每个 batch 一次 BB forward; expert 复用 feat.detach() 不需要二次前向。
+    两个独立 optimizer, 互不干扰。LR schedule:
+      - ep ∈ [0, cosine_end_ep):  cosine 衰减
+      - ep ∈ [cosine_end_ep, max_epochs):  常量 = lr_init * lr_const_factor (微调段)
+    cosine_end_ep=None 时等价于 cosine 一路衰减到 max_epochs (原版行为)。
     """
     bb = bb.to(device); ed = etf.to(device); expert = expert.to(device)
     bb.train(); expert.train()
 
+    if cosine_end_ep is None:
+        cosine_end_ep = max_epochs
+
     opt_bb = torch.optim.Adam(bb.parameters(), lr=lr_bb)
     opt_exp = torch.optim.Adam(expert.parameters(), lr=lr_exp)
-    sch_bb = torch.optim.lr_scheduler.CosineAnnealingLR(opt_bb, T_max=max_epochs)
-    sch_exp = torch.optim.lr_scheduler.CosineAnnealingLR(opt_exp, T_max=max_epochs)
     amp = (torch.amp.autocast('cuda', dtype=torch.bfloat16) if USE_BF16
            else torch.amp.autocast('cuda', enabled=False))
 
@@ -58,6 +74,14 @@ def train_joint(bb, expert, loader, classes, etf, max_epochs, snapshot_epochs,
     desc = f" Joint c{client_id}" if client_id is not None else " Joint"
     pbar = tqdm(range(max_epochs), desc=desc, ncols=100, mininterval=10.0, file=sys.stdout)
     for ep in pbar:
+        # set LR for this epoch (piecewise: cosine then constant)
+        cur_lr_bb = _piecewise_lr(ep, lr_bb, cosine_end_ep, lr_const_factor)
+        cur_lr_exp = _piecewise_lr(ep, lr_exp, cosine_end_ep, lr_const_factor)
+        for g in opt_bb.param_groups:
+            g['lr'] = cur_lr_bb
+        for g in opt_exp.param_groups:
+            g['lr'] = cur_lr_exp
+
         el_bb = 0.0; el_e = 0.0; nb = 0
         for x, y in loader:
             x = x.to(device, non_blocking=True); y = y.to(device, non_blocking=True)
@@ -80,9 +104,8 @@ def train_joint(bb, expert, loader, classes, etf, max_epochs, snapshot_epochs,
 
             el_bb += loss_bb.item(); el_e += loss_exp.item(); nb += 1
 
-        sch_bb.step(); sch_exp.step()
         ep_num = ep + 1
-        pbar.set_postfix(bb=f"{el_bb/max(nb,1):.3f}", exp=f"{el_e/max(nb,1):.3f}")
+        pbar.set_postfix(bb=f"{el_bb/max(nb,1):.3f}", exp=f"{el_e/max(nb,1):.3f}", lr=f"{cur_lr_bb:.1e}")
 
         if ep_num in snap_set:
             snapshots[ep_num] = (
@@ -193,17 +216,23 @@ def main():
     parser.add_argument('--ld', type=int, default=64, help='shared expert latent dim')
     parser.add_argument('--n_blocks', type=int, default=3, help='res blocks per side')
     parser.add_argument('--snapshots', type=str,
-                        default='10,20,30,50,75,100,150,200,250,300,400,500,600',
+                        default='1,2,3,5,7,10,15,20,30,50,75,100,150,200,300,400,500,600,650,700',
                         help='comma-separated epoch list for evaluation')
+    parser.add_argument('--cosine_end_ep', type=int, default=600,
+                        help='cosine 在该 epoch 衰减完, 之后切常量微调 LR; 留作 None 等于 max_ep')
+    parser.add_argument('--lr_const_factor', type=float, default=0.01,
+                        help='cosine_end_ep 之后的常量 LR = lr_init * factor (默认 1%)')
     args = parser.parse_args()
 
     ALPHA = args.alpha; SEED = args.seed; NC = args.n_clients
     NL = 10; FD = 256
     MAX_EP = args.max_ep
     HD, LD, NB = args.hd, args.ld, args.n_blocks
+    COSINE_END = args.cosine_end_ep
     SNAPSHOT_EPOCHS = sorted(set(int(x) for x in args.snapshots.split(',')))
     assert max(SNAPSHOT_EPOCHS) <= MAX_EP, \
         f"snapshot {max(SNAPSHOT_EPOCHS)} 超过 max_ep {MAX_EP}"
+    assert COSINE_END <= MAX_EP, f"cosine_end_ep {COSINE_END} > max_ep {MAX_EP}"
 
     torch.manual_seed(SEED); np.random.seed(SEED)
     if torch.cuda.is_available(): torch.cuda.manual_seed_all(SEED)
@@ -215,7 +244,7 @@ def main():
 
     print(f"\n{'='*70}")
     print(f"  Epoch Analysis (Joint, Shared Expert): α={ALPHA}, K={NC}, seed={SEED}")
-    print(f"  Max epochs: {MAX_EP}")
+    print(f"  Max epochs: {MAX_EP}  (cosine→ep{COSINE_END}, then constant {args.lr_const_factor:g}× LR)")
     print(f"  Snapshots ({len(SNAPSHOT_EPOCHS)}): {SNAPSHOT_EPOCHS}")
     print(f"  Expert: hd={HD}, ld={LD}, n_blocks={NB} → {n_params/1e6:.2f}M params")
     print(f"  LR: bb={args.lr_bb}, exp={args.lr_exp}")
@@ -240,7 +269,8 @@ def main():
         expert = SharedConditionalExpert(FD, FD, HD, LD, NB)
         bb, expert, snaps = train_joint(
             bb, expert, cal[k], cls, etf, MAX_EP, SNAPSHOT_EPOCHS,
-            lr_bb=args.lr_bb, lr_exp=args.lr_exp, NL=NL, FD=FD, client_id=k)
+            lr_bb=args.lr_bb, lr_exp=args.lr_exp, NL=NL, FD=FD, client_id=k,
+            cosine_end_ep=COSINE_END, lr_const_factor=args.lr_const_factor)
         bb.cpu(); expert.cpu()
         del bb, expert
         torch.cuda.empty_cache()
@@ -285,7 +315,8 @@ def main():
     out = {
         'experiment': 'epoch_analysis_joint',
         'alpha': ALPHA, 'n_clients': NC, 'seed': SEED,
-        'max_epb': MAX_EP,
+        'max_epb': MAX_EP, 'cosine_end_ep': COSINE_END,
+        'lr_const_factor': args.lr_const_factor,
         'expert_config': {'hd': HD, 'ld': LD, 'n_blocks': NB, 'n_params': n_params},
         'snapshot_epochs': SNAPSHOT_EPOCHS,
         'train_time': train_time,
