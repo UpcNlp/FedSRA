@@ -48,13 +48,16 @@ def _piecewise_lr(ep, lr_init, cosine_end, const_factor=0.01):
 
 def train_joint(bb, expert, loader, classes, etf, max_epochs, snapshot_epochs,
                 lr_bb=1e-3, lr_exp=1e-3, NL=10, FD=256, client_id=None,
-                cosine_end_ep=None, lr_const_factor=0.01):
+                cosine_end_ep=None, lr_const_factor=0.01, snapshot_dir=None):
     """单阶段: BB (ETF loss) + 共享 expert (重构+排斥 loss, detach feat 不污染 BB)。
 
     两个独立 optimizer, 互不干扰。LR schedule:
       - ep ∈ [0, cosine_end_ep):  cosine 衰减
       - ep ∈ [cosine_end_ep, max_epochs):  常量 = lr_init * lr_const_factor (微调段)
     cosine_end_ep=None 时等价于 cosine 一路衰减到 max_epochs (原版行为)。
+
+    snapshot_dir 非空: snapshot 直接落盘 {snapshot_dir}/client_{client_id}/ep{N}.pt,
+                       不在 RAM 累积 (避免 OOM)。返回的 snapshots dict 为空。
     """
     bb = bb.to(device); ed = etf.to(device); expert = expert.to(device)
     bb.train(); expert.train()
@@ -70,6 +73,11 @@ def train_joint(bb, expert, loader, classes, etf, max_epochs, snapshot_epochs,
     ncl = len(classes)
     snap_set = set(snapshot_epochs)
     snapshots = {}
+
+    client_save_dir = None
+    if snapshot_dir is not None and client_id is not None:
+        client_save_dir = os.path.join(snapshot_dir, f'client_{client_id}')
+        os.makedirs(client_save_dir, exist_ok=True)
 
     desc = f" Joint c{client_id}" if client_id is not None else " Joint"
     pbar = tqdm(range(max_epochs), desc=desc, ncols=100, mininterval=10.0, file=sys.stdout)
@@ -108,11 +116,13 @@ def train_joint(bb, expert, loader, classes, etf, max_epochs, snapshot_epochs,
         pbar.set_postfix(bb=f"{el_bb/max(nb,1):.3f}", exp=f"{el_e/max(nb,1):.3f}", lr=f"{cur_lr_bb:.1e}")
 
         if ep_num in snap_set:
-            snapshots[ep_num] = (
-                copy.deepcopy(bb.cpu().state_dict()),
-                copy.deepcopy(expert.cpu().state_dict()),
-            )
-            bb.to(device); expert.to(device)
+            bb_sd = {k: v.detach().cpu() for k, v in bb.state_dict().items()}
+            exp_sd = {k: v.detach().cpu() for k, v in expert.state_dict().items()}
+            if client_save_dir is not None:
+                torch.save({'bb': bb_sd, 'expert': exp_sd},
+                           os.path.join(client_save_dir, f'ep{ep_num}.pt'))
+            else:
+                snapshots[ep_num] = (bb_sd, exp_sd)
             tqdm.write(f"      ep{ep_num}/{max_epochs} "
                        f"bb={el_bb/max(nb,1):.4f} exp={el_e/max(nb,1):.4f} [snap]")
     pbar.close()
@@ -253,11 +263,15 @@ def main():
     etf = generate_etf(NL, FD)
     cal, ccl, tl, ccc = prepare_data(NC, ALPHA, NL)
 
+    # snapshots → 磁盘 (避免 200 套 state_dict 占满 RAM)
+    SNAPSHOT_DIR = f"snapshots/joint_a{ALPHA}_k{NC}_s{SEED}"
+    os.makedirs(SNAPSHOT_DIR, exist_ok=True)
+    print(f"\n  Snapshots → {SNAPSHOT_DIR}/client_<k>/ep<N>.pt")
+
     # ──────────────────────────────────────────────
-    # Phase 1: 各 client 联合训练, 在 SNAPSHOT_EPOCHS 处保存 (bb, expert)
+    # Phase 1: 各 client 联合训练, snapshot 直接落盘
     # ──────────────────────────────────────────────
     print(f"\n  Phase 1: Joint train ({MAX_EP} ep, single-stage)")
-    all_snapshots = {ep: {'bb': [], 'exp': []} for ep in SNAPSHOT_EPOCHS}
     client_classes = []
     t0_total = time.time()
 
@@ -267,31 +281,35 @@ def main():
         print(f"\n  Client {k}: {len(cls)} cls, {sum(ccc[k].values())} samp")
         bb = ResNet18Backbone(FD)
         expert = SharedConditionalExpert(FD, FD, HD, LD, NB)
-        bb, expert, snaps = train_joint(
+        train_joint(
             bb, expert, cal[k], cls, etf, MAX_EP, SNAPSHOT_EPOCHS,
             lr_bb=args.lr_bb, lr_exp=args.lr_exp, NL=NL, FD=FD, client_id=k,
-            cosine_end_ep=COSINE_END, lr_const_factor=args.lr_const_factor)
+            cosine_end_ep=COSINE_END, lr_const_factor=args.lr_const_factor,
+            snapshot_dir=SNAPSHOT_DIR)
         bb.cpu(); expert.cpu()
         del bb, expert
         torch.cuda.empty_cache()
-        for ep in SNAPSHOT_EPOCHS:
-            bb_sd, exp_sd = snaps[ep]
-            all_snapshots[ep]['bb'].append(bb_sd)
-            all_snapshots[ep]['exp'].append(exp_sd)
 
     train_time = time.time() - t0_total
     print(f"\n  Joint training done: {train_time:.0f}s ({train_time/60:.1f} min)")
 
     # ──────────────────────────────────────────────
-    # Phase 2: 逐 snapshot 评估 (forward only, no retrain)
+    # Phase 2: 逐 snapshot 从磁盘加载 + 评估
     # ──────────────────────────────────────────────
     print(f"\n  Phase 2: Evaluating {len(SNAPSHOT_EPOCHS)} snapshots")
     results = {}
     for ep in SNAPSHOT_EPOCHS:
         print(f"\n  --- Epoch {ep} ---")
         t0 = time.time()
+        bb_sds, exp_sds = [], []
+        for k in range(NC):
+            ckpt = torch.load(
+                os.path.join(SNAPSHOT_DIR, f'client_{k}', f'ep{ep}.pt'),
+                map_location='cpu', weights_only=True)
+            bb_sds.append(ckpt['bb'])
+            exp_sds.append(ckpt['expert'])
         accs = evaluate_at_epoch_joint(
-            all_snapshots[ep]['bb'], all_snapshots[ep]['exp'],
+            bb_sds, exp_sds,
             client_classes, tl, etf, ccc, NC, NL, FD,
             hd=HD, ld=LD, n_blocks=NB)
         results[ep] = accs
