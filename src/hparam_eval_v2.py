@@ -2,7 +2,7 @@
 hparam_eval_v2.py - 扫 αf 敏感性
 ================================
 加载 saved_models 里的 backbones+experts(无需重训),
-扫描 11 档 αf,记录 acc。
+扫描 28 档 αf,记录 acc。
 
 用法:
   python hparam_eval_v2.py --alpha 0.05 --n_clients 10 --seed 42
@@ -122,8 +122,16 @@ def main():
         'K': NC, 'N': N, 'nc': NL,
     }
 
-    # 扫描 αf
-    alphas = [0.0, 0.1, 0.3, 0.5, 0.7, 1.0, 1.5, 2.0, 3.0, 5.0]
+    # 扫描 αf — 28 档密网格. 三段:
+    #   [0, 0.1):  adaptive α_f 落点区, 11 档 步长 0.01
+    #   [0.1, 1):  峰值区, 11 档 0.05–0.1 步
+    #   [1, 5]:    下坡区, 6 档稀疏
+    alphas = [
+        0.0,
+        0.005, 0.01, 0.02, 0.03, 0.04, 0.05, 0.06, 0.07, 0.08, 0.09,
+        0.1, 0.15, 0.2, 0.25, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9,
+        1.0, 1.25, 1.5, 2.0, 3.0, 5.0,
+    ]
     acc_union = float((data['union_preds'] == labels).mean())
     acc_expert = float((expert_original(data) == labels).mean())
 
@@ -138,13 +146,30 @@ def main():
         else:
             preds = cross_client_per_client_logits(data, alpha=af, min_n=10)
             accs[str(af)] = float((preds == labels).mean())
-        print(f"    αf={af:5.1f}: {accs[str(af)]:.4f}")
+        print(f"    αf={af:5.2f}: {accs[str(af)]:.4f}")
+
+    # Adaptive α_f (same formula as ablation_components_v2.py / run_znorm_*.py)
+    coverage = np.zeros(NL)
+    for c in range(NL):
+        coverage[c] = sum(1 for k in range(NC)
+                         if ccc.get(k, {}).get(c, 0) >= 10) / NC
+    af_adaptive = float(0.2 * coverage.mean())
+    if af_adaptive > 0:
+        preds_adaptive = cross_client_per_client_logits(data, alpha=af_adaptive, min_n=10)
+        acc_adaptive = float((preds_adaptive == labels).mean())
+    else:
+        acc_adaptive = acc_union
+    print(f"\n  Adaptive α_f = {af_adaptive:.4f}  (coverage.mean={coverage.mean():.4f})")
+    print(f"  Acc @ adaptive = {acc_adaptive:.4f}")
 
     out = {
         'method': 'hparam_v2',
         'alpha': ALPHA, 'n_clients': NC, 'seed': SEED,
         'min_n': 10,
         'accs': accs,
+        'adaptive_af': af_adaptive,
+        'adaptive_acc': acc_adaptive,
+        'coverage_mean': float(coverage.mean()),
     }
     os.makedirs('results', exist_ok=True)
     path = f"results/hparam_v2_a{ALPHA}_k{NC}_s{SEED}.json"
