@@ -13,7 +13,7 @@ PY=${PY:-/public/home/dongshou/anaconda/envs/ct/bin/python}
 SEED=42
 NC=10
 MAX_EP=700
-COSINE_END=600                                    # 1..600 用 cosine (匹配旧 run), 601..700 切常量微调 LR
+COSINE_END=700                                    # cosine 一路衰减到 700 (clean schedule)
 SNAPS="1,2,3,5,7,10,15,20,30,50,75,100,150,200,300,400,500,600,650,700"
 
 run() {
