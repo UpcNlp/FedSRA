@@ -167,27 +167,18 @@ def etf_al(features,labels,etf):
     return (1-(features*etf[labels]).sum(1)).mean()
 
 def etf_pr(features,labels,etf,temp=0.1):
-    """Pure relational: ② push-from-OTHER-anchors + ③ sample contrast, NO ① pull-to-self.
-    NOTE: on a zero-sum ETF frame, ② push implicitly aligns features toward own anchor,
-    so this is not behaviorally 'intrinsic-free' — but the loss carries no explicit ① term."""
-    features=F.normalize(features,dim=1);bs=features.size(0);C=etf.size(0)
-    # ② push: minimize similarity to OTHER class anchors (no reward for own anchor)
+    """STRICTLY pure relational: ONLY ② push-from-OTHER-anchors. NO ① pull-to-self,
+    NO ③ sample contrast (③'s same-class-pull is an intrinsic / within-class term).
+    The loss carries ZERO intrinsic component. Within-class clustering still EMERGES
+    via the zero-sum ETF geometry (Σe_c=0 ⇒ pushing from others implicitly aligns to
+    own anchor) — that emergent alignment is the role of ETF as a shared frame, not an
+    explicit intrinsic loss."""
+    features=F.normalize(features,dim=1);C=etf.size(0)
+    # ② push: minimize similarity to OTHER class anchors only (own anchor masked out)
     logits=torch.mm(features,etf.T)/temp
     mask_self=F.one_hot(labels,C).bool()
     push=torch.logsumexp(logits.masked_fill(mask_self,float('-inf')),dim=1).mean()
-    # ③ sample contrast (identical to lsamp in etf_cl)
-    lsamp=torch.tensor(0.0,device=features.device)
-    if bs>1:
-        sm=torch.eye(bs,device=features.device,dtype=torch.bool);ns=~sm
-        sim=torch.mm(features,features.T)/temp
-        mp=(labels.unsqueeze(0)==labels.unsqueeze(1)).float()*ns.float()
-        pc=mp.sum(1);v=pc>0
-        if v.sum()>0:
-            ss=sim-sim.max(1,keepdim=True)[0].detach()
-            es=torch.exp(ss)*ns.float()
-            lp_=ss-torch.log(es.sum(1)+1e-8).unsqueeze(1)
-            lsamp=-(mp*lp_).sum(1)[v]/(pc[v]+1e-8);lsamp=lsamp.mean()
-    return push+0.5*lsamp
+    return push
 
 def train_bb(bb,loader,classes,etf,epochs=600,lr=1e-3,save_dir=None,client_id=None,
              save_every=20, save_at_epochs=None, save_fp16=True, loss_type='J'):
