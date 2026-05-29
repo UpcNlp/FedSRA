@@ -166,6 +166,29 @@ def etf_al(features,labels,etf):
     features=F.normalize(features,dim=1)
     return (1-(features*etf[labels]).sum(1)).mean()
 
+def etf_pr(features,labels,etf,temp=0.1):
+    """Pure relational: ② push-from-OTHER-anchors + ③ sample contrast, NO ① pull-to-self.
+    NOTE: on a zero-sum ETF frame, ② push implicitly aligns features toward own anchor,
+    so this is not behaviorally 'intrinsic-free' — but the loss carries no explicit ① term."""
+    features=F.normalize(features,dim=1);bs=features.size(0);C=etf.size(0)
+    # ② push: minimize similarity to OTHER class anchors (no reward for own anchor)
+    logits=torch.mm(features,etf.T)/temp
+    mask_self=F.one_hot(labels,C).bool()
+    push=torch.logsumexp(logits.masked_fill(mask_self,float('-inf')),dim=1).mean()
+    # ③ sample contrast (identical to lsamp in etf_cl)
+    lsamp=torch.tensor(0.0,device=features.device)
+    if bs>1:
+        sm=torch.eye(bs,device=features.device,dtype=torch.bool);ns=~sm
+        sim=torch.mm(features,features.T)/temp
+        mp=(labels.unsqueeze(0)==labels.unsqueeze(1)).float()*ns.float()
+        pc=mp.sum(1);v=pc>0
+        if v.sum()>0:
+            ss=sim-sim.max(1,keepdim=True)[0].detach()
+            es=torch.exp(ss)*ns.float()
+            lp_=ss-torch.log(es.sum(1)+1e-8).unsqueeze(1)
+            lsamp=-(mp*lp_).sum(1)[v]/(pc[v]+1e-8);lsamp=lsamp.mean()
+    return push+0.5*lsamp
+
 def train_bb(bb,loader,classes,etf,epochs=600,lr=1e-3,save_dir=None,client_id=None,
              save_every=20, save_at_epochs=None, save_fp16=True, loss_type='J'):
     """
@@ -173,13 +196,15 @@ def train_bb(bb,loader,classes,etf,epochs=600,lr=1e-3,save_dir=None,client_id=No
                     If provided, save_every is ignored.
     save_fp16:      cast snapshot to fp16 to halve disk footprint (eval-only use).
     loss_type:      ablation backbone training loss
-                      'J' = etf_cl + 0.5*etf_al  (default; joint = NC1+NC2, current behavior)
-                      'R' = etf_cl only           (relational only; NC2)
-                                                  Falls back to etf_al when ncl<2 (etf_cl undefined).
-                      'I' = etf_al only           (intrinsic only; NC1)
+                      'J'  = etf_cl + 0.5*etf_al  (default; joint = ①②③+①)
+                      'R'  = etf_cl only          (①②③: pull+push+contrast)
+                                                  Falls back to etf_al when ncl<2.
+                      'I'  = etf_al only          (① pull-to-self only; pure intrinsic)
+                      'PR' = etf_pr               (②③ push-from-others + contrast, NO ① pull;
+                                                   pure-relational row). Falls back to etf_al when ncl<2.
     """
     import os,copy as _copy
-    assert loss_type in ('J', 'R', 'I'), f"loss_type must be one of J/R/I, got {loss_type}"
+    assert loss_type in ('J', 'R', 'I', 'PR'), f"loss_type must be J/R/I/PR, got {loss_type}"
     bb=bb.to(device);ed=etf.to(device);ncl=len(classes);bb.train()
     opt=torch.optim.Adam(bb.parameters(),lr=lr)
     sch=torch.optim.lr_scheduler.CosineAnnealingLR(opt,T_max=epochs)
@@ -188,7 +213,7 @@ def train_bb(bb,loader,classes,etf,epochs=600,lr=1e-3,save_dir=None,client_id=No
     bb_ckpts = {}
     snap_set = set(save_at_epochs) if save_at_epochs else None
     # Track whether this client's R-only training degenerated to etf_al due to ncl<2
-    r_fallback = (loss_type == 'R' and ncl < 2)
+    r_fallback = (loss_type in ('R', 'PR') and ncl < 2)
     pbar = tqdm(range(epochs), desc=f"  BB c{client_id}[{loss_type}{'*' if r_fallback else ''}]",
                 ncols=100, mininterval=10.0, file=sys.stdout)
     for ep in pbar:
@@ -202,6 +227,9 @@ def train_bb(bb,loader,classes,etf,epochs=600,lr=1e-3,save_dir=None,client_id=No
                     else:      loss=etf_al(f,y,ed)
                 elif loss_type == 'R':
                     if ncl>=2: loss=etf_cl(f,y,ed)
+                    else:      loss=etf_al(f,y,ed)   # forced fallback
+                elif loss_type == 'PR':
+                    if ncl>=2: loss=etf_pr(f,y,ed)
                     else:      loss=etf_al(f,y,ed)   # forced fallback
                 else:  # 'I'
                     loss=etf_al(f,y,ed)

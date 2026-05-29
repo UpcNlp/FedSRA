@@ -82,7 +82,7 @@ def main():
     parser.add_argument('--dataset', type=str, required=True,
                         choices=['cifar10', 'cifar100'])
     parser.add_argument('--loss_type', type=str, required=True,
-                        choices=['R', 'I', 'J'])
+                        choices=['R', 'I', 'J', 'PR'])
     parser.add_argument('--alpha', type=float, required=True)
     parser.add_argument('--n_clients', type=int, required=True)
     parser.add_argument('--seed', type=int, default=42)
