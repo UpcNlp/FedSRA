@@ -1,0 +1,10 @@
+{
+  "group": "fedric-ablation",
+  "host": "50527",
+  "label": "RIJ c100 K20 (a0.3-0.5)",
+  "experiment": "RIJ c100 K20 (a0.3-0.5)",
+  "gpu": "0",
+  "queue": ["cifar100_K20_a0.3_R","cifar100_K20_a0.3_I","cifar100_K20_a0.5_R","cifar100_K20_a0.5_I"],
+  "started": "2026-05-29 12:08:04",
+  "n_queue": 4
+}
