@@ -108,6 +108,8 @@ def main():
     parser.add_argument('--alpha', type=float, required=True)
     parser.add_argument('--n_clients', type=int, required=True)
     parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--dataset', type=str, default='cifar10',
+                        choices=['cifar10', 'cifar100'])
     parser.add_argument('--use_experts', action='store_true',
                         help='Also compute fused (relational+intrinsic) acc with fixed alpha_f.')
     parser.add_argument('--alpha_f', type=float, default=0.3,
@@ -115,14 +117,18 @@ def main():
     args = parser.parse_args()
 
     ALPHA = args.alpha; NC = args.n_clients; SEED = args.seed
-    NL = 10; FD = 256
+    NL = 10 if args.dataset == 'cifar10' else 100; FD = 256
 
-    save_dir = f"saved_models/a{ALPHA}_k{NC}_s{SEED}"
+    # Legacy saved_models layout differs by dataset (J backbones from main table)
+    if args.dataset == 'cifar10':
+        save_dir = f"saved_models/a{ALPHA}_k{NC}_s{SEED}"
+    else:
+        save_dir = f"saved_models/cifar100_a{ALPHA}_k{NC}_s{SEED}"
     if not os.path.exists(save_dir):
         print(f"saved_models 不存在: {save_dir}")
         return
 
-    print(f"\nAblation aggregation: α={ALPHA}, K={NC}, seed={SEED}")
+    print(f"\nAblation aggregation: dataset={args.dataset}, α={ALPHA}, K={NC}, seed={SEED}")
     print(f"  Loading from {save_dir}...")
     torch.manual_seed(SEED); np.random.seed(SEED)
     etf = generate_etf(NL, FD)
@@ -130,7 +136,11 @@ def main():
     n_loaded = sum(1 for b in bbs if b is not None)
     print(f"  Loaded {n_loaded}/{NC} clients")
 
-    _, _, tl, _ = prepare_data(NC, ALPHA, NL)
+    if args.dataset == 'cifar10':
+        _, _, tl, _ = prepare_data(NC, ALPHA, NL)
+    else:
+        from rebuild8_cifar100 import prepare_data_cifar100
+        _, _, tl, _ = prepare_data_cifar100(NC, ALPHA, NL)
     ed = etf.to(device)
     N = 10000
 
@@ -210,7 +220,7 @@ def main():
         print(line)
 
     out = {
-        'cell': {'alpha': ALPHA, 'K': NC, 'seed': SEED},
+        'cell': {'dataset': args.dataset, 'alpha': ALPHA, 'K': NC, 'seed': SEED},
         'union_only_per_combo': union_table,
         'alpha_f': args.alpha_f,
     }
@@ -218,7 +228,8 @@ def main():
         out['fused_per_combo'] = fused_table
 
     os.makedirs('results', exist_ok=True)
-    path = f"results/ablation_agg_a{ALPHA}_k{NC}_s{SEED}.json"
+    tag = '' if args.dataset == 'cifar10' else f'{args.dataset}_'
+    path = f"results/ablation_agg_{tag}a{ALPHA}_k{NC}_s{SEED}.json"
     json.dump(out, open(path, 'w'), indent=2)
     print(f"\n  Saved: {path}")
 
