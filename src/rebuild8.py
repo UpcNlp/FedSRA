@@ -167,18 +167,28 @@ def etf_al(features,labels,etf):
     return (1-(features*etf[labels]).sum(1)).mean()
 
 def etf_pr(features,labels,etf,temp=0.1):
-    """STRICTLY pure relational: ONLY ② push-from-OTHER-anchors. NO ① pull-to-self,
-    NO ③ sample contrast (③'s same-class-pull is an intrinsic / within-class term).
-    The loss carries ZERO intrinsic component. Within-class clustering still EMERGES
-    via the zero-sum ETF geometry (Σe_c=0 ⇒ pushing from others implicitly aligns to
-    own anchor) — that emergent alignment is the role of ETF as a shared frame, not an
-    explicit intrinsic loss."""
-    features=F.normalize(features,dim=1);C=etf.size(0)
-    # ② push: minimize similarity to OTHER class anchors only (own anchor masked out)
+    """STRICTLY pure relational: ② push-from-OTHER-anchors + ③' sample push-from-OTHER-class.
+    NO ① pull-to-self, NO same-class attraction. Every term is purely inter-class (relational);
+    zero intrinsic component.
+    Why ③' (and not full SupCon ③): full SupCon's same-class-pull is a within-class/intrinsic
+    term. Why ③' is needed at all: ② alone has ~0.1 dynamic range on a 100-class near-orthogonal
+    ETF (e_y·e_c≈-1/99) so its gradient vanishes (loss stuck at log(C-1)); the sample-level
+    inter-class repulsion ③' provides the actual training signal. Within-class clustering still
+    EMERGES from the zero-sum ETF geometry, not from any explicit attractive term."""
+    features=F.normalize(features,dim=1);C=etf.size(0);bs=features.size(0)
+    # ② anchor push: repel from OTHER class ETF anchors (own anchor masked out)
     logits=torch.mm(features,etf.T)/temp
-    mask_self=F.one_hot(labels,C).bool()
-    push=torch.logsumexp(logits.masked_fill(mask_self,float('-inf')),dim=1).mean()
-    return push
+    push_anchor=torch.logsumexp(logits.masked_fill(F.one_hot(labels,C).bool(),float('-inf')),dim=1).mean()
+    # ③' sample push-only: repel DIFFERENT-class samples; NO same-class attraction term
+    push_samp=torch.tensor(0.0,device=features.device)
+    if bs>1:
+        sim=torch.mm(features,features.T)/temp
+        diff=(labels.unsqueeze(0)!=labels.unsqueeze(1))   # different-class pairs only
+        has_diff=diff.any(1)
+        if has_diff.any():
+            sim_d=sim.masked_fill(~diff,float('-inf'))
+            push_samp=torch.logsumexp(sim_d[has_diff],dim=1).mean()
+    return push_anchor+0.5*push_samp
 
 def train_bb(bb,loader,classes,etf,epochs=600,lr=1e-3,save_dir=None,client_id=None,
              save_every=20, save_at_epochs=None, save_fp16=True, loss_type='J'):
