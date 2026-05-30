@@ -9,7 +9,7 @@
 # ============================================================
 set -u
 cd /public/home/dongshou/fedETF/ETF-pesuade
-source /opt/dtk/env.sh 2>/dev/null || true   # 海光 DCU 运行时 (galaxyhip/LD_LIBRARY_PATH)
+set +u; source /opt/dtk/env.sh 2>/dev/null || true; set -u   # 海光 DCU 运行时; env.sh 引用未定义 LD_LIBRARY_PATH, 需临时关 set -u
 git config --global --add safe.directory /public/home/dongshou/fedETF 2>/dev/null || true
 PY=/public/home/dongshou/anaconda/envs/ct/bin/python
 TS=$(date +%Y%m%d_%H%M%S)
