@@ -114,18 +114,28 @@ def main():
                         help='Also compute fused (relational+intrinsic) acc with fixed alpha_f.')
     parser.add_argument('--alpha_f', type=float, default=0.3,
                         help='Fixed fusion weight used in --use_experts mode.')
+    parser.add_argument('--save_dir', type=str, default=None,
+                        help='Explicit backbone dir override; bypasses path auto-detection.')
     args = parser.parse_args()
 
     ALPHA = args.alpha; NC = args.n_clients; SEED = args.seed
     NL = 10 if args.dataset == 'cifar10' else 100; FD = 256
 
-    # Legacy saved_models layout differs by dataset (J backbones from main table)
-    if args.dataset == 'cifar10':
-        save_dir = f"saved_models/a{ALPHA}_k{NC}_s{SEED}"
+    # saved_models layout differs by dataset AND by K (K=5 ablation dirs use a
+    # different prefix than the K=10/20/50 main-table dirs). Try candidates in order.
+    if args.save_dir:
+        candidates = [args.save_dir]
+    elif args.dataset == 'cifar10':
+        candidates = [f"saved_models/a{ALPHA}_k{NC}_s{SEED}",                 # K=10/20 legacy
+                      f"saved_models/ablation_cifar10_a{ALPHA}_k{NC}_s{SEED}",  # K=5 ablation
+                      f"saved_models/ablation_cifar10/J_a{ALPHA}_k{NC}_s{SEED}"]  # canonical symlink
     else:
-        save_dir = f"saved_models/cifar100_a{ALPHA}_k{NC}_s{SEED}"
-    if not os.path.exists(save_dir):
-        print(f"saved_models 不存在: {save_dir}")
+        candidates = [f"saved_models/cifar100_a{ALPHA}_k{NC}_s{SEED}",
+                      f"saved_models/ablation_cifar100_a{ALPHA}_k{NC}_s{SEED}",
+                      f"saved_models/ablation_cifar100/J_a{ALPHA}_k{NC}_s{SEED}"]
+    save_dir = next((d for d in candidates if os.path.exists(d)), None)
+    if save_dir is None:
+        print(f"saved_models 不存在,尝试过: {candidates}")
         return
 
     print(f"\nAblation aggregation: dataset={args.dataset}, α={ALPHA}, K={NC}, seed={SEED}")
