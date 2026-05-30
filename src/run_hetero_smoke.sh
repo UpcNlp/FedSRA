@@ -4,6 +4,7 @@
 # 用法: bash run_hetero_smoke.sh [GPU_ID]
 set -e
 cd /public/home/dongshou/fedETF/ETF-pesuade
+source /opt/dtk/env.sh 2>/dev/null || true   # 海光 DCU 运行时 (galaxyhip/LD_LIBRARY_PATH)
 PY=/public/home/dongshou/anaconda/envs/ct/bin/python
 G=${1:-0}
 mkdir -p logs
