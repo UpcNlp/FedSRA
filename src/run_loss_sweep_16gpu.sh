@@ -10,9 +10,10 @@
 #
 # Single node with 16 GPUs:
 #     GPUS="0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15" bash run_loss_sweep_16gpu.sh
-# Split across nodes (run one per node; jobs are sharded by NSHARD/SHARD):
-#     node A:  GPUS="0 1 2 3 4 5 6 7" NSHARD=2 SHARD=0 bash run_loss_sweep_16gpu.sh
-#     node B:  GPUS="0 1 2 3 4 5 6 7" NSHARD=2 SHARD=1 bash run_loss_sweep_16gpu.sh
+# Split across nodes by contiguous slice (run one per node; disjoint -> no race):
+#     node 14233: GPUS="0 1 2 3 4 5 6 7" JSTART=0  JCOUNT=8 bash run_loss_sweep_16gpu.sh
+#     node 89984: GPUS="0 1 2 3"         JSTART=8  JCOUNT=4 bash run_loss_sweep_16gpu.sh
+#     node 37703: GPUS="0 1 2 3"         JSTART=12 JCOUNT=4 bash run_loss_sweep_16gpu.sh
 set -u
 cd "$(dirname "$0")"
 mkdir -p results logs/loss_sweep
@@ -30,8 +31,6 @@ PYTHON="${PYTHON:-/public/home/dongshou/anaconda/envs/ct/bin/python}"
 SEED="${SEED:-42}"
 K="${K:-5}"
 GPUS="${GPUS:-0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15}"
-NSHARD="${NSHARD:-1}"      # number of nodes sharing the job list
-SHARD="${SHARD:-0}"        # this node's shard index (0-based)
 read -r -a GPU_ARR <<< "$GPUS"
 NGPU=${#GPU_ARR[@]}
 
@@ -49,13 +48,12 @@ for a in 0.05 0.1 0.3 0.5; do
   done
 done
 
-# --- keep only this node's shard ---
-JOBS=()
-for i in "${!ALL_JOBS[@]}"; do
-  if [ $(( i % NSHARD )) -eq "$SHARD" ]; then JOBS+=("${ALL_JOBS[$i]}"); fi
-done
+# --- keep only this node's contiguous slice (disjoint across nodes -> no race) ---
+JSTART="${JSTART:-0}"
+JCOUNT="${JCOUNT:-${#ALL_JOBS[@]}}"
+JOBS=("${ALL_JOBS[@]:$JSTART:$JCOUNT}")
 
-echo "Node shard $SHARD/$NSHARD | GPUs: $GPUS | cells this node: ${#JOBS[@]} | K=$K seed=$SEED"
+echo "Slice [$JSTART,+$JCOUNT) | GPUs: $GPUS | cells this node: ${#JOBS[@]} | K=$K seed=$SEED"
 
 # --- GPU semaphore via fd 9 (preloaded with this node's GPU ids) ---
 fifo=$(mktemp -u); mkfifo "$fifo"; exec 9<>"$fifo"; rm "$fifo"
@@ -81,4 +79,4 @@ for job in "${JOBS[@]}"; do
   ) &
 done
 wait
-echo "==== shard $SHARD DONE ===="
+echo "==== slice [$JSTART,+$JCOUNT) DONE ===="
