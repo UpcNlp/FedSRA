@@ -29,10 +29,12 @@ NGPU=${#GPU_ARR[@]}
 # Only the lambda_al sweep (the alignment-vs-discriminative weight, the single
 # explicit balancing coefficient in Eq. bb). tau is a temperature, kept fixed
 # at its default 0.1 and reported as a constant in the paper. lambda_al=0.5 is
-# the main-table config -> skipped (reuse main result).
+# the main-table config -> skipped (reuse main result). lambda_al=0 (alignment
+# term removed) is a component ablation already covered by the ablation study,
+# so it is excluded here; every swept point keeps both loss terms active.
 ALL_JOBS=()
 for a in 0.05 0.1 0.3 0.5; do
-  for lal in 0 0.1 0.25 1.0 2.0; do
+  for lal in 0.1 0.25 1.0 2.0; do
     ALL_JOBS+=("$lal 0.1 $a")
   done
 done
