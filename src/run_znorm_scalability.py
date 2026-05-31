@@ -81,7 +81,12 @@ def main():
                 bbs.append(None); client_exps.append({}); continue
             print(f"  Client {k}: {len(cls)} cls, {sum(ccc[k].values())} samp")
             bb = ResNet18Backbone(FD)
-            bb = train_bb(bb, cal[k], cls, etf, EPB, save_dir=save_dir, client_id=k)
+            # BB snapshots: V5 figure points (10/30/50/100/150/300) + later (400/500/600).
+            # Enables future per-class expert retraining at each epoch for
+            # local-epoch convergence eval without redoing BB.
+            SNAPSHOT_EPOCHS = [10, 30, 50, 100, 150, 300, 400, 500, 600]
+            bb = train_bb(bb, cal[k], cls, etf, EPB, save_dir=save_dir, client_id=k,
+                          save_at_epochs=SNAPSHOT_EPOCHS, save_fp16=True)
             exps = train_experts(bb, ccl[k], cls, etf, NL, FD, LD, EPE)
             bbs.append(bb.cpu())
             client_exps.append({c: exp.cpu() for c, exp in exps.items()})
