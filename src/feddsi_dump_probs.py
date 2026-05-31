@@ -62,15 +62,22 @@ def main():
     en[~has.unsqueeze(1).expand_as(en)] = 0
 
     fused = un + args.alpha_f * en
-    probs = F.softmax(fused, dim=1).numpy()
+    rel_probs = F.softmax(un, dim=1).numpy()          # relational signal (ERL/ETF)
+    int_probs = F.softmax(en, dim=1).numpy()          # intrinsic signal (experts)
+    fused_probs = F.softmax(fused, dim=1).numpy()     # dual-signal fusion (DAF)
     acc_union = float((un.argmax(1).numpy() == labels).mean())
+    acc_int = float((en.argmax(1).numpy() == labels).mean())
     acc_fused = float((fused.argmax(1).numpy() == labels).mean())
-    print(f"FedDSI(J) a={args.alpha} K={NC} | union={acc_union:.4f} fused(af={args.alpha_f})={acc_fused:.4f}", flush=True)
+    print(f"FedDSI(J) a={args.alpha} K={NC} | rel={acc_union:.4f} int={acc_int:.4f} "
+          f"fused(af={args.alpha_f})={acc_fused:.4f}", flush=True)
 
     os.makedirs(os.path.dirname(args.out), exist_ok=True)
-    np.savez_compressed(args.out, probs=probs.astype(np.float16),
+    np.savez_compressed(args.out, probs=fused_probs.astype(np.float16),
+                        rel_probs=rel_probs.astype(np.float16),
+                        int_probs=int_probs.astype(np.float16),
+                        fused_probs=fused_probs.astype(np.float16),
                         labels=labels.astype(np.int16),
-                        acc_union=acc_union, acc_fused=acc_fused, alpha_f=args.alpha_f)
+                        acc_union=acc_union, acc_int=acc_int, acc_fused=acc_fused, alpha_f=args.alpha_f)
     print("saved", args.out, flush=True)
 
 
