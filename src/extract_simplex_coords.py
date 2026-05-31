@@ -14,12 +14,14 @@ def l2(a, ax=-1):
 
 etf = l2(np.load(f"{TMP}/align_ERL_a0.05_k20.npz", allow_pickle=True)["etf"].astype(np.float32))
 out = {"etf_dim": etf.shape}
-for a in ALPHAS:
-    d = np.load(f"{TMP}/decision_a{a}_k{K}.npz", allow_pickle=True)
+# ERL across alpha + a CE (w/o ETF) baseline at alpha=0.05
+SOURCES = [(f"decision_a{a}_k{K}.npz", a) for a in ALPHAS] + [("decision_CE_a0.05_k20.npz", "CE")]
+for fname, key in SOURCES:
+    d = np.load(f"{TMP}/{fname}", allow_pickle=True)
     cos = (l2(d["rel_feat"].astype(np.float32)) @ etf.T).astype(np.float16)
-    out[f"cos_{a}"] = cos
-    out[f"lab_{a}"] = d["labels"].astype(np.int16)
-    out[f"covacc_{a}"] = np.array([float(d["coverage"]), float(d["acc_union"])], np.float32)
-    print(a, "cos", cos.shape, "acc_union", float(d["acc_union"]), flush=True)
+    out[f"cos_{key}"] = cos
+    out[f"lab_{key}"] = d["labels"].astype(np.int16)
+    out[f"covacc_{key}"] = np.array([float(d["coverage"]), float(d["acc_union"])], np.float32)
+    print(key, "cos", cos.shape, "acc_union", float(d["acc_union"]), flush=True)
 np.savez_compressed(f"{TMP}/simplex_coords_k{K}.npz", **out)
 print("saved", f"{TMP}/simplex_coords_k{K}.npz")
