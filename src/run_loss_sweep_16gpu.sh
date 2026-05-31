@@ -26,17 +26,14 @@ read -r -a GPU_ARR <<< "$GPUS"
 NGPU=${#GPU_ARR[@]}
 
 # --- build job list:  "lambda_al tau alpha" ---
+# Only the lambda_al sweep (the alignment-vs-discriminative weight, the single
+# explicit balancing coefficient in Eq. bb). tau is a temperature, kept fixed
+# at its default 0.1 and reported as a constant in the paper. lambda_al=0.5 is
+# the main-table config -> skipped (reuse main result).
 ALL_JOBS=()
-# (1) lambda_al sweep  (tau fixed at default 0.1; skip lal=0.5)
 for a in 0.05 0.1 0.3 0.5; do
   for lal in 0 0.1 0.25 1.0 2.0; do
     ALL_JOBS+=("$lal 0.1 $a")
-  done
-done
-# (2) tau sweep  (lambda_al fixed at default 0.5; skip tau=0.1)
-for a in 0.05 0.1 0.3 0.5; do
-  for tau in 0.05 0.2 0.5; do
-    ALL_JOBS+=("0.5 $tau $a")
   done
 done
 
