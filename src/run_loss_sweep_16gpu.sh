@@ -17,6 +17,16 @@ set -u
 cd "$(dirname "$0")"
 mkdir -p results logs/loss_sweep
 
+# --- ROCm/DTK env (SSH non-interactive shells lack it -> torch ImportError).
+#     /opt/dtk/env.sh references an unbound var, so wrap against set -u. ---
+set +u; source /opt/dtk/env.sh 2>/dev/null || true; set -u
+
+PYTHON="${PYTHON:-/public/home/dongshou/anaconda/envs/ct/bin/python}"
+
+# --- sanity probe: fail loudly instead of silently writing 0 results ---
+"$PYTHON" -c "import torch; assert torch.cuda.is_available(); print('torch OK, GPUs:', torch.cuda.device_count())" \
+  || { echo "FATAL: torch/ROCm not usable in this shell — aborting."; exit 1; }
+
 SEED="${SEED:-42}"
 K="${K:-5}"
 GPUS="${GPUS:-0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15}"
@@ -62,7 +72,7 @@ for job in "${JOBS[@]}"; do
   echo "[$(date +%H:%M:%S)] [launch GPU$g] $tag"
   (
     CUDA_VISIBLE_DEVICES=$g HIP_VISIBLE_DEVICES=$g \
-      python -u run_loss_sweep.py \
+      "$PYTHON" -u run_loss_sweep.py \
         --alpha "$a" --lambda_al "$lal" --tau "$tau" \
         --n_clients "$K" --seed "$SEED" \
         > "logs/loss_sweep/${tag}.log" 2>&1
