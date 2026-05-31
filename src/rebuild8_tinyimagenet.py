@@ -75,19 +75,32 @@ class TinyImageNetValDataset(Dataset):
         assert class_to_idx is not None, "Must pass class_to_idx from training ImageFolder"
         self.class_to_idx = class_to_idx
 
-        # 解析 val_annotations.txt
+        # 支持两种 val 布局，二者产出的 (image, label) 一致、结果可比：
+        #  (a) 原始扁平布局: val/val_annotations.txt + val/images/<fname>
+        #  (b) 按类子目录布局: val/<wnid>/<fname>  (ImageFolder 式, 已被重组)
         ann_path = os.path.join(root, 'val_annotations.txt')
-        with open(ann_path) as f:
-            for line in f.readlines():
-                parts = line.strip().split('\t')
-                fname = parts[0]
-                wnid = parts[1]
-                img_path = os.path.join(root, 'images', fname)
-                if wnid not in self.class_to_idx:
+        if os.path.exists(ann_path):
+            with open(ann_path) as f:
+                for line in f.readlines():
+                    parts = line.strip().split('\t')
+                    fname = parts[0]
+                    wnid = parts[1]
+                    img_path = os.path.join(root, 'images', fname)
+                    if wnid not in self.class_to_idx:
+                        continue
+                    label = self.class_to_idx[wnid]
+                    self.samples.append((img_path, label))
+                    self.targets.append(label)
+        else:
+            for wnid in sorted(os.listdir(root)):
+                cls_dir = os.path.join(root, wnid)
+                if not os.path.isdir(cls_dir) or wnid not in self.class_to_idx:
                     continue
                 label = self.class_to_idx[wnid]
-                self.samples.append((img_path, label))
-                self.targets.append(label)
+                for fname in sorted(os.listdir(cls_dir)):
+                    self.samples.append((os.path.join(cls_dir, fname), label))
+                    self.targets.append(label)
+        assert len(self.samples) > 0, f"No val images found under {root} (neither flat nor per-class layout)"
 
     def __len__(self):
         return len(self.samples)

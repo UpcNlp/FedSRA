@@ -20,4 +20,5 @@ echo "=== $(date) START a=$ALPHA s=$SEED on GPU $GPU ($(hostname)) ===" | tee -a
 CUDA_VISIBLE_DEVICES=$GPU HIP_VISIBLE_DEVICES=$GPU \
   $PY -u run_znorm_tinyimagenet.py --alpha $ALPHA --n_clients 5 --seed $SEED \
   >> "$LOG" 2>&1
-echo "=== $(date) DONE a=$ALPHA s=$SEED rc=$? ===" | tee -a "$LOG"
+RC=$?  # capture before $(date) clobbers $?
+echo "=== $(date) DONE a=$ALPHA s=$SEED rc=$RC ===" | tee -a "$LOG"
