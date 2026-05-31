@@ -26,7 +26,7 @@ from rebuild8 import device, prepare_data, generate_etf
 from resnet18_filter_merge import ResNet18Backbone
 
 NL, FD = 10, 256
-PER_CLASS_SUB = 80   # test images per class kept for the t-SNE subset
+PER_CLASS_SUB = int(os.environ.get("PER_CLASS_SUB", "80"))  # test imgs/class for t-SNE subset
 
 
 @torch.no_grad()
