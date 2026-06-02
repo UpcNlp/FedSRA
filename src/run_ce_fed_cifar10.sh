@@ -19,8 +19,9 @@ mkdir -p logs saved_models
 
 ALPHA=0.05; K=10; SEED=42
 
-# 10 clients, mapped to 8 GPUs (clients 8 and 9 share GPUs 0 and 1)
-declare -a GPU_MAP=(0 1 2 3 4 5 6 7 0 1)
+# 10 clients on GPUs 1-7 (GPU 0 reserved for user's eval job).
+# Clients 7/8/9 share GPUs 1/2/3 with clients 0/1/2 (2 jobs per GPU).
+declare -a GPU_MAP=(1 2 3 4 5 6 7 1 2 3)
 
 for i in 0 1 2 3 4 5 6 7 8 9; do
   gpu=${GPU_MAP[$i]}
