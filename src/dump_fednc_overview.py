@@ -81,8 +81,9 @@ def main():
     ap.add_argument('--alpha', type=float, default=0.05)
     ap.add_argument('--K', type=int, default=10)
     ap.add_argument('--seed', type=int, default=42)
-    ap.add_argument('--n_sub', type=int, default=5000,
-                    help='samples per setting to keep (uniform per class)')
+    ap.add_argument('--n_sub', type=int, default=10000,
+                    help='samples per setting to keep (uniform per class). '
+                         '10000 = full CIFAR-10 test set, 1000 per class.')
     ap.add_argument('--centralized_dir',
                     default='saved_models/centralized_cifar10_s42/client_0')
     ap.add_argument('--federated_dir_template',
