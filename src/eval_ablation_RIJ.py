@@ -201,6 +201,17 @@ def main():
     else:
         print(f"  row J+Expert: ─── (J saved_models or experts missing)")
 
+    sd_I = f"{base}/I_a{ALPHA}_k{NC}_s{SEED}"
+    acc_ie, nload = eval_row('I+E', sd_I, tl, ccc, etf, NC, FD, NL, N,
+                              alpha_fusion=args.alpha_fusion,
+                              min_n=args.min_n, use_experts=True)
+    rows['I+Expert'] = {'acc': acc_ie, 'n_clients_loaded': nload,
+                         'alpha_fusion': args.alpha_fusion, 'min_n': args.min_n}
+    if acc_ie is not None:
+        print(f"  row I+Expert: {acc_ie*100:6.2f}%  (α_f={args.alpha_fusion}, min_n={args.min_n})")
+    else:
+        print(f"  row I+Expert: ─── (I saved_models or I-experts missing)")
+
     out = {
         'cell': {'dataset': args.dataset, 'alpha': ALPHA, 'K': NC, 'seed': SEED},
         'aggregation': 'znorm+postL2+sqrt',

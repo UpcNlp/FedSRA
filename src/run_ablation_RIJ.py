@@ -92,6 +92,9 @@ def main():
                         help='Expert epochs. Default 600 (cifar10) / 200 (cifar100).')
     parser.add_argument('--skip_experts', action='store_true',
                         help='Skip expert training even when loss_type=J.')
+    parser.add_argument('--train_experts', action='store_true',
+                        help='Train experts regardless of loss_type (for the '
+                             'I+Expert loss-ablation row).')
     parser.add_argument('--resume', action='store_true',
                         help='If saved backbones already exist, skip backbone training.')
     args = parser.parse_args()
@@ -165,10 +168,12 @@ def main():
                 bb.load_state_dict(torch.load(bp, map_location='cpu', weights_only=True))
                 bbs[k] = bb
 
-    # ── 2) Experts (only for J) ────────────────────────────────
+    # ── 2) Experts (J by default; I when --train_experts) ──────
     client_exps = [{} for _ in range(NC)]
     train_exp_time = 0.0
-    if args.loss_type == 'J' and not args.skip_experts:
+    train_exp_flag = ((args.loss_type == 'J') or args.train_experts) \
+                     and not args.skip_experts
+    if train_exp_flag:
         # Skip if all experts already exist
         all_exp_exist = True
         for k in range(NC):
@@ -212,7 +217,7 @@ def main():
         'gpu_peak_mb': round(gpu_peak_mb, 1),
         'r_fallback_clients': r_fallback_clients,
         'r_fallback_count': len(r_fallback_clients),
-        'has_experts': (args.loss_type == 'J' and not args.skip_experts),
+        'has_experts': train_exp_flag,
         'save_dir': save_dir,
     }
     meta_path = (f"results/ablation_RIJ_meta_"
