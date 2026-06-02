@@ -86,17 +86,19 @@ def main():
     N = len(all_labels)
     print(f"[fafi] {N} test samples, NL={NL}", flush=True)
 
-    # Forward each client backbone, accumulate feature_norm sum.
+    # Forward each client's ENCODER (un-normalized output), accumulate sum.
+    # This matches FAFI's WEnsembleFeature: feature_total = Σ w_k · enc_k(x)
+    # and L2-normalize ONLY at the end (which is what eval_with_proto does).
+    # Normalising per client before summing destroys magnitude info — gave the
+    # spurious off-diag = +0.99 in the earlier dump.
     feat_sum = np.zeros((N, FD), np.float32)
     n_loaded = 0
     for k in range(K):
         ckpt_path = os.path.join(ckpt_root, f'client_{k}', f'epoch_{args.epoch}.pth')
         if not os.path.isfile(ckpt_path):
             print(f"[warn] missing: {ckpt_path}", flush=True); continue
-        # Build model and load state_dict
         model = get_train_models(args.model_name, num_classes=NL, mode='our')
         sd = torch.load(ckpt_path, map_location='cpu', weights_only=False)
-        # FAFI sometimes wraps in a dict; if so unwrap.
         if isinstance(sd, dict) and 'state_dict' in sd:
             sd = sd['state_dict']
         elif not isinstance(sd, dict):
@@ -108,26 +110,29 @@ def main():
         with torch.no_grad():
             for x, _ in test_loader:
                 x = x.to(device, non_blocking=True)
-                _, feat_norm = model(x)        # (B, 512), already L2-normed
-                feats.append(feat_norm.cpu().numpy())
+                # FAFI's WEnsembleFeature uses model.encoder(x) directly,
+                # NOT the L2-normed feature_norm returned by model(x).
+                feat = model.encoder(x)        # (B, 512), un-normalized
+                feats.append(feat.cpu().numpy())
         feats = np.concatenate(feats, axis=0)  # (N, 512)
-        feat_sum += feats
+        feat_sum += feats                       # weight = 1/K (uniform)
         n_loaded += 1
         model.cpu()
         if torch.cuda.is_available(): torch.cuda.empty_cache()
-        print(f"[fafi] client {k} done", flush=True)
+        print(f"[fafi] client {k} encoder forwarded", flush=True)
 
     if n_loaded == 0:
         raise RuntimeError("no FAFI clients loaded")
-    feat_ens = feat_sum / n_loaded             # arithmetic mean across clients
-    feat_ens_n = l2(feat_ens)                  # final L2 renormalize
+    feat_ens = feat_sum / n_loaded             # weighted sum (uniform weights)
+    feat_ens_n = l2(feat_ens)                  # final L2 norm (as eval_with_proto does)
 
-    # Class means + NC matrix (in 512-D, then a 10x10 cosine matrix)
+    # Class means + NC matrix (on the L2-normed ensemble feature, matching
+    # what FAFI's classifier head actually consumes via eval_with_proto)
     mus = np.zeros((NL, FD), np.float32)
     for c in range(NL):
         mask = (all_labels == c)
         if mask.any():
-            mus[c] = feat_ens[mask].mean(0)
+            mus[c] = feat_ens_n[mask].mean(0)
     mus_n = l2(mus)
     nc_mat = mus_n @ mus_n.T
 
