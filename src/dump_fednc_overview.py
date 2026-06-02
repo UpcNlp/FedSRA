@@ -81,8 +81,8 @@ def main():
     ap.add_argument('--alpha', type=float, default=0.05)
     ap.add_argument('--K', type=int, default=10)
     ap.add_argument('--seed', type=int, default=42)
-    ap.add_argument('--n_sub', type=int, default=2000,
-                    help='samples per setting to keep for 2D scatter (uniform per class)')
+    ap.add_argument('--n_sub', type=int, default=5000,
+                    help='samples per setting to keep (uniform per class)')
     ap.add_argument('--centralized_dir',
                     default='saved_models/centralized_cifar10_s42/client_0')
     ap.add_argument('--federated_dir_template',
@@ -116,7 +116,9 @@ def main():
             idxs = np.where(labels == c)[0]
             keep.append(rng.choice(idxs, size=min(per_cls, len(idxs)), replace=False))
         keep = np.concatenate(keep)
-        feats_2d = feats_full[keep] @ W.T
+        feats_sub = feats_full[keep]
+        feats_sub_n = l2(feats_sub)            # 256-D, unit-norm; figure can re-project
+        feats_2d = feats_sub @ W.T             # legacy ETF-PCA 2D (back-compat)
         mus_2d = mus @ W.T
         out = os.path.join(
             args.out_dir,
@@ -124,6 +126,7 @@ def main():
         np.savez_compressed(
             out,
             feats_2d=feats_2d.astype(np.float32),
+            feats_256=feats_sub_n.astype(np.float32),   # NEW: per-sample L2-norm 256-D
             labels=labels[keep].astype(np.int32),
             class_means_256=mus.astype(np.float32),
             class_means_2d=mus_2d.astype(np.float32),
@@ -134,7 +137,7 @@ def main():
             setting=setting,
             alpha=args.alpha, K=args.K, seed=args.seed,
         )
-        print(f"[save] {out}", flush=True)
+        print(f"[save] {out}  (feats_256 shape {feats_sub_n.shape})", flush=True)
         print(f"   NC matrix diag mean = {np.diag(nc_mat).mean():.3f}, "
               f"off-diag mean = {nc_mat[~np.eye(NL, dtype=bool)].mean():.3f} "
               f"(ideal off-diag = {-1/(NL-1):.3f})", flush=True)
