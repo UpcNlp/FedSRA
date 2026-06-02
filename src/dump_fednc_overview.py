@@ -87,6 +87,10 @@ def main():
                     default='saved_models/centralized_cifar10_s42/client_0')
     ap.add_argument('--federated_dir_template',
                     default='saved_models/a{alpha}_k{K}_s{seed}')
+    ap.add_argument('--ce_fed_dir_template',
+                    default='saved_models/ce_cifar10_a{alpha}_k{K}_s{seed}',
+                    help='federated CE backbones (no ETF) for the '
+                         '"no ETF" column of the fednc_overview figure')
     ap.add_argument('--out_dir', default='results')
     args = ap.parse_args()
 
@@ -179,6 +183,32 @@ def main():
     print("Aggregating: GPA  ...", flush=True)
     feats_gpa = aggregate_gpa(raw_f, args.K, N, FD, w_sqrtn)
     write_setting('fedDSI', feats_gpa, labels_f)
+
+    # ---------- 4. federated CE + Ensemble (no ETF anchor) ----------
+    ce_dir = args.ce_fed_dir_template.format(
+        alpha=args.alpha, K=args.K, seed=args.seed)
+    print(f"\n=== Federated CE (no ETF) from {ce_dir} ===", flush=True)
+    if not os.path.isdir(ce_dir):
+        print(f"[warn] CE federated dir missing: {ce_dir} — skipping", flush=True)
+    else:
+        bbs_ce = load_backbones(ce_dir, args.K, FD)
+        n_ce = sum(1 for b in bbs_ce if b is not None)
+        if n_ce == 0:
+            print(f"[warn] no CE backbones loaded from {ce_dir} — skipping",
+                  flush=True)
+        else:
+            print(f"   loaded {n_ce}/{args.K} CE clients", flush=True)
+            raw_ce, labels_ce, _ = forward_features(
+                bbs_ce, [{} for _ in range(args.K)], tl, etf_t, args.K,
+                FD, NL, use_experts=False)
+            # Ensemble at the feature level = simple arithmetic mean across
+            # clients (the feature analogue of logit ensembling).
+            feat_ens = np.zeros((len(labels_ce), FD), np.float32); n_sum = 0
+            for k in range(args.K):
+                if raw_ce[k] is None: continue
+                feat_ens += raw_ce[k].numpy().astype(np.float32); n_sum += 1
+            feat_ens /= max(n_sum, 1)
+            write_setting('ce_fed_ens', feat_ens, labels_ce)
 
 
 if __name__ == '__main__':
