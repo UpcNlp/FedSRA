@@ -25,7 +25,7 @@ if [ -f "$CENT_BB" ]; then
 else
     echo "[$(date +%H:%M:%S)] start centralized training"
     HIP_VISIBLE_DEVICES=$GPU CUDA_VISIBLE_DEVICES=$GPU \
-        $PY -u train_centralized_cifar10.py --seed 42 \
+        $PY -u train_centralized_cifar10.py --seed 42 --epochs 300 \
         > logs/centralized_cifar10_train.log 2>&1
     rc=$?
     echo "[$(date +%H:%M:%S)] centralized training done rc=$rc"
