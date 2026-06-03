@@ -15,21 +15,33 @@ SEED=42
 LOGDIR=logs/woetf_${NODE}
 mkdir -p $LOGDIR
 
-# Rebalanced v3: K=5 cells are heavy (~3h each due to high samples-per-client).
-# Each 89984 GPU does K=50+K=20+K=5 for one α (~8h); 50527 does all K=10 cells (~6h).
-# Critical path ~8h (was 12h with K=5 stacked on 50527)
+# Rebalanced v4: 14233 (8 GPU) + 89984 (4 GPU) = 12 GPU, critical path ~3.4h.
+# 14233: 4 K=50 + 4 K=5 (heaviest cells, one per GPU)
+# 89984: 4 GPUs each do K=20 + K=10 same α
 case "$NODE" in
+  14233)
+    declare -A ASSIGN
+    ASSIGN[0]="0.05:50"
+    ASSIGN[1]="0.1:50"
+    ASSIGN[2]="0.3:50"
+    ASSIGN[3]="0.5:50"
+    ASSIGN[4]="0.05:5"
+    ASSIGN[5]="0.1:5"
+    ASSIGN[6]="0.3:5"
+    ASSIGN[7]="0.5:5"
+    GPUS=(0 1 2 3 4 5 6 7)
+    ;;
   89984)
     declare -A ASSIGN
-    ASSIGN[0]="0.05:50 0.05:20 0.05:5"
-    ASSIGN[1]="0.1:50  0.1:20  0.1:5"
-    ASSIGN[2]="0.3:50  0.3:20  0.3:5"
-    ASSIGN[3]="0.5:50  0.5:20  0.5:5"
+    ASSIGN[0]="0.05:20 0.05:10"
+    ASSIGN[1]="0.1:20  0.1:10"
+    ASSIGN[2]="0.3:20  0.3:10"
+    ASSIGN[3]="0.5:20  0.5:10"
     GPUS=(0 1 2 3)
     ;;
-  50527)
+  50527)  # backup / unused in v4
     declare -A ASSIGN
-    ASSIGN[0]="0.05:10 0.1:10 0.3:10 0.5:10"
+    ASSIGN[0]=""
     GPUS=(0)
     ;;
   *) echo "Unknown node: $NODE"; exit 1 ;;
