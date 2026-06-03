@@ -26,7 +26,9 @@ from rebuild8 import device, USE_BF16, prepare_data, etf_cl, etf_al
 def train_bb_with_W(bb, W_k, loader, classes, epochs=300, lr=1e-3, lambda_al=0.5,
                     client_id=None):
     """Train backbone + learnable W_k jointly with etf_cl + lambda_al * etf_al."""
-    bb = bb.to(device); W_k = W_k.to(device); bb.train()
+    bb = bb.to(device); bb.train()
+    # Re-wrap W_k as a leaf Parameter on the target device (avoids non-leaf error)
+    W_k = nn.Parameter(W_k.detach().to(device))
     opt = torch.optim.Adam(list(bb.parameters()) + [W_k], lr=lr)
     sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
     amp = (torch.amp.autocast('cuda', dtype=torch.bfloat16) if USE_BF16
