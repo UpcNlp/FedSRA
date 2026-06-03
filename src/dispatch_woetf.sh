@@ -15,19 +15,20 @@ SEED=42
 LOGDIR=logs/woetf_${NODE}
 mkdir -p $LOGDIR
 
-# Greedy bin-packed assignment (longest-first across 5 GPUs)
+# Rebalanced: each 89984 GPU does K=50+K=20 of same α (~7h); 50527 does all K=10+K=5 (~6h)
+# Critical path 7h (was 8.5h with previous assignment)
 case "$NODE" in
   89984)
     declare -A ASSIGN
-    ASSIGN[0]="0.05:50 0.5:10 0.5:5"
-    ASSIGN[1]="0.1:50  0.3:10 0.3:5"
-    ASSIGN[2]="0.3:50  0.5:20"
-    ASSIGN[3]="0.5:50  0.1:20 0.05:10 0.05:5"
+    ASSIGN[0]="0.05:50 0.05:20"
+    ASSIGN[1]="0.1:50  0.1:20"
+    ASSIGN[2]="0.3:50  0.3:20"
+    ASSIGN[3]="0.5:50  0.5:20"
     GPUS=(0 1 2 3)
     ;;
   50527)
     declare -A ASSIGN
-    ASSIGN[0]="0.05:20 0.3:20 0.1:10 0.1:5"
+    ASSIGN[0]="0.05:10 0.1:10 0.3:10 0.5:10 0.05:5 0.1:5 0.3:5 0.5:5"
     GPUS=(0)
     ;;
   *) echo "Unknown node: $NODE"; exit 1 ;;
