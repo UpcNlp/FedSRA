@@ -27,8 +27,9 @@ eval_ablation_RIJ.znorm_sqrt_aggregate exactly.
 """
 import os, argparse
 import numpy as np, torch, torch.nn.functional as F
-from rebuild8 import prepare_data, generate_etf
-from eval_ablation_RIJ import load_backbones, forward_features, znorm_sqrt_aggregate
+from rebuild8 import generate_etf
+from eval_ablation_RIJ import (load_backbones, forward_features,
+                               znorm_sqrt_aggregate, get_test_loader_and_ccc)
 
 
 def l2_np(a, ax=-1):
@@ -42,6 +43,7 @@ def main():
     ap.add_argument('--seed', type=int, default=42)
     ap.add_argument('--save_dir', required=True)
     ap.add_argument('--out', required=True)
+    ap.add_argument('--dataset', default='cifar10', choices=['cifar10', 'cifar100'])
     ap.add_argument('--NL', type=int, default=10, help='num classes (10 / 100)')
     ap.add_argument('--FD', type=int, default=256, help='feature dim')
     args = ap.parse_args()
@@ -53,7 +55,7 @@ def main():
     etf = generate_etf(NL, FD)
     En = l2_np(etf.numpy().astype(np.float32))                 # [C, FD]
 
-    _, _, tl, ccc = prepare_data(NC, args.alpha, NL)
+    tl, ccc = get_test_loader_and_ccc(args.dataset, NC, args.alpha, NL)
     bbs = load_backbones(args.save_dir, NC, FD)
     all_raw, labels, _ = forward_features(bbs, [{} for _ in range(NC)], tl, etf,
                                           NC, FD, NL, use_experts=False)
