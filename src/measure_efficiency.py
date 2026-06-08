@@ -222,13 +222,17 @@ if __name__ == '__main__':
     results = []
     methods = ['ofedavg', 'ensemble', 'dense', 'coboosting', 'fafi', 'ours']
 
-    # (bs, n_test, repeat): batched throughput at bs=256; per-sample latency at bs=1
-    # (bs=1 uses a smaller n_test/repeat so K=50 stays tractable; everything is reported per-image).
-    configs = [(256, 10000, 5), (1, 2000, 3)]
+    # (bs, n_test, repeat, warmup): batched throughput/memory at bs=256 (the core table);
+    # per-sample latency at bs=1 (lighter n_test/repeat so high-K stays tractable -- per-image
+    # latency is stable at small n). bs loop is OUTER so the fast, important bs=256 sweep over
+    # ALL K finishes first; results are flushed to disk after every cell.
+    configs = [(256, 10000, 5, 3), (1, 256, 2, 1)]
+    out_path = 'results/efficiency_measurements.json'
 
-    for K in [5, 10, 20, 50]:
-        print(f"\n{'='*60}\n  K = {K}\n{'='*60}")
-        for bs, n_test, repeat in configs:
+    for bs, n_test, repeat, warmup in configs:
+        print(f"\n{'#'*60}\n  bs = {bs}\n{'#'*60}")
+        for K in [5, 10, 20, 50]:
+            print(f"  --- K = {K} ---")
             for method in methods:
                 # 'ours' also gets a streaming-backbone variant -> O(1) peak memory
                 variants = [False, True] if method == 'ours' else [False]
@@ -236,7 +240,7 @@ if __name__ == '__main__':
                     tag = method + ('-stream' if stream else '')
                     try:
                         r = measure_inference(method, K, n_test=n_test, bs=bs,
-                                              repeat=repeat, stream=stream)
+                                              repeat=repeat, warmup=warmup, stream=stream)
                     except RuntimeError as e:
                         if 'out of memory' in str(e).lower():
                             print(f"  {tag:>14s} [bs={bs:>3d}]: OOM at K={K}")
@@ -249,9 +253,9 @@ if __name__ == '__main__':
                     if r.get('ms_per_img', -1) >= 0:
                         print(f"  {tag:>14s} [bs={bs:>3d}]: "
                               f"{r['ms_per_img']:7.3f} ms/img, {r['throughput_img_s']:8.0f} img/s, "
-                              f"mem={r['gpu_peak_mb']:7.1f}MB, up={r['upload_mb']:7.1f}MB")
+                              f"mem={r['gpu_peak_mb']:7.1f}MB, up={r['upload_mb']:7.1f}MB", flush=True)
                     results.append(r)
+                    json.dump(results, open(out_path, 'w'), indent=2)   # incremental flush
             torch.cuda.empty_cache()
 
-    json.dump(results, open('results/efficiency_measurements.json', 'w'), indent=2)
-    print(f"\nSaved: results/efficiency_measurements.json ({len(results)} rows)")
+    print(f"\nSaved: {out_path} ({len(results)} rows)")
