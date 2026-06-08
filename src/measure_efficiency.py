@@ -52,10 +52,11 @@ class ResNet18(nn.Module):
 
 # === ResNet18Backbone (OURS) ===
 from resnet18_filter_merge import ResNet18Backbone
-from rebuild8 import ConditionalExpert
 
-def measure_inference(method, K, nc=10, fd=256, n_test=10000, bs=256, warmup=3, repeat=5):
-    """测量 server inference time + GPU peak memory"""
+def measure_inference(method, K, nc=10, fd=256, n_test=10000, bs=256, warmup=3, repeat=5, stream=False):
+    """测量 server inference time + GPU peak memory.
+    stream=True (仅对 'ours' 有意义): backbone 逐个搬上 GPU -> 前向 -> 搬回 CPU,
+    使 GPU 同一时刻只驻留 1 个 backbone, 峰值显存与 K 无关 (O(1) vs O(K))。"""
     torch.cuda.reset_peak_memory_stats()
     torch.cuda.empty_cache()
     
@@ -143,53 +144,48 @@ def measure_inference(method, K, nc=10, fd=256, n_test=10000, bs=256, warmup=3, 
         for m in models: m.cpu()
 
     elif method == 'ours':
-        # K backbone forward + znorm + expert eval
-        bbs = [ResNet18Backbone(fd).to(device).eval() for _ in range(K)]
+        # K backbone forward -> per-client znorm -> coverage-weighted sum -> L2 -> ETF sim.
+        # NO conditional experts: the deployed union path is backbone -> znorm -> etf only,
+        # so we must not allocate experts (they would inflate peak memory unfairly).
         etf = F.normalize(torch.randn(nc, fd), dim=1)
-        # experts: ~5 per client
-        n_exp_per_client = max(1, nc // K)
-        experts = {}
-        for k in range(K):
-            for c in range(n_exp_per_client):
-                experts[(k, c)] = ConditionalExpert(fd, fd, 128, 32).to(device).eval()
+        if stream:
+            bbs = [ResNet18Backbone(fd).eval() for _ in range(K)]        # stay on CPU
+        else:
+            bbs = [ResNet18Backbone(fd).to(device).eval() for _ in range(K)]
+
+        def bb_feat(bb, x):
+            xx = F.relu(bb.bn1(bb.conv1(x)))
+            xx = bb.layer1(xx); xx = bb.layer2(xx)
+            xx = bb.layer3(xx); xx = bb.layer4(xx)
+            return bb.fc(bb.pool(xx).flatten(1))
+
+        def run_once():
+            all_raw = []
+            for bb in bbs:
+                if stream: bb.to(device)
+                feats = []
+                for x, _ in test_loader:
+                    feats.append(bb_feat(bb, x.to(device)).cpu())
+                all_raw.append(torch.cat(feats, 0))
+                if stream:
+                    bb.cpu(); torch.cuda.empty_cache()
+            # znorm + sqrt(n) aggregation (mirrors run_znorm_scalability.py:137-148)
+            feat = torch.zeros(n_test, fd)
+            for f in all_raw:
+                f_z = (f - f.mean(0, keepdim=True)) / (f.std(0, keepdim=True) + 1e-8)
+                feat += f_z * np.sqrt(5000)
+            feat_n = F.normalize(feat / (np.sqrt(5000) * K), dim=1)
+            return feat_n @ etf.T
 
         for _ in range(warmup):
-            with torch.no_grad():
-                for x, _ in test_loader:
-                    x = x.to(device)
-                    for bb in bbs:
-                        xx = F.relu(bb.bn1(bb.conv1(x)))
-                        xx = bb.layer1(xx); xx = bb.layer2(xx)
-                        xx = bb.layer3(xx); xx = bb.layer4(xx)
-                        bb.fc(bb.pool(xx).flatten(1))
-
+            with torch.no_grad(): run_once()
         torch.cuda.reset_peak_memory_stats()
         times = []
         for _ in range(repeat):
             t0 = time.time()
-            all_raw = []
-            with torch.no_grad():
-                for k, bb in enumerate(bbs):
-                    feats = []
-                    for x, _ in test_loader:
-                        x = x.to(device)
-                        xx = F.relu(bb.bn1(bb.conv1(x)))
-                        xx = bb.layer1(xx); xx = bb.layer2(xx)
-                        xx = bb.layer3(xx); xx = bb.layer4(xx)
-                        feat = bb.fc(bb.pool(xx).flatten(1))
-                        feats.append(feat.cpu())
-                    all_raw.append(torch.cat(feats, 0))
-                # znorm + sqrt(n)
-                feat = torch.zeros(n_test, fd)
-                for k in range(K):
-                    f = all_raw[k]
-                    f_z = (f - f.mean(0, keepdim=True)) / (f.std(0, keepdim=True) + 1e-8)
-                    feat += f_z * np.sqrt(5000)
-                feat_n = F.normalize(feat / (np.sqrt(5000) * K), dim=1)
-                logits = feat_n @ etf.T
+            with torch.no_grad(): run_once()
             times.append(time.time() - t0)
         for bb in bbs: bb.cpu()
-        for exp in experts.values(): exp.cpu()
 
     else:
         raise ValueError(f"Unknown method: {method}")
@@ -199,38 +195,63 @@ def measure_inference(method, K, nc=10, fd=256, n_test=10000, bs=256, warmup=3, 
     avg_time = np.mean(times)
     std_time = np.std(times)
 
+    # upload / communication cost (fp32 param bytes): single-model methods send 1 model,
+    # ensemble/fafi/ours send all K client models/backbones.
+    def _mb(m): return sum(p.numel() for p in m.parameters()) * 4 / 1024**2
+    if method in ('ofedavg', 'dense', 'coboosting'):
+        upload_mb = _mb(ResNet18(nc))
+    elif method in ('ensemble', 'fafi'):
+        upload_mb = K * _mb(ResNet18(nc))
+    else:  # ours
+        upload_mb = K * _mb(ResNet18Backbone(fd))
+
     return {
-        'method': method, 'K': K,
-        'inference_time_mean': round(avg_time, 4),
-        'inference_time_std': round(std_time, 4),
+        'method': method, 'K': K, 'bs': bs, 'n_test': n_test, 'stream': stream,
+        'time_total_s_mean': round(avg_time, 4),
+        'time_total_s_std': round(std_time, 4),
+        'ms_per_img': round(avg_time / n_test * 1000, 4),
+        'throughput_img_s': round(n_test / avg_time, 1),
         'gpu_peak_mb': round(peak_mb, 1),
+        'upload_mb': round(upload_mb, 1),
     }
 
 
 if __name__ == '__main__':
+    import os
+    os.makedirs('results', exist_ok=True)
     results = []
     methods = ['ofedavg', 'ensemble', 'dense', 'coboosting', 'fafi', 'ours']
 
-    for K in [5, 10, 20, 50]:
-        print(f"\n{'='*50}")
-        print(f"  K = {K}")
-        print(f"{'='*50}")
-        for method in methods:
-            if K == 50 and method in ['ensemble', 'fafi', 'ours']:
-                # K=50 加载 50 个模型可能 OOM,尝试
-                try:
-                    r = measure_inference(method, K)
-                except RuntimeError as e:
-                    print(f"  {method:>12s}: OOM at K={K}")
-                    r = {'method': method, 'K': K, 'inference_time_mean': -1, 'gpu_peak_mb': -1}
-            else:
-                r = measure_inference(method, K)
-            print(f"  {method:>12s}: time={r['inference_time_mean']:.4f}s, mem={r['gpu_peak_mb']:.1f}MB")
-            results.append(r)
-        torch.cuda.empty_cache()
+    # (bs, n_test, repeat): batched throughput at bs=256; per-sample latency at bs=1
+    # (bs=1 uses a smaller n_test/repeat so K=50 stays tractable; everything is reported per-image).
+    configs = [(256, 10000, 5), (1, 2000, 3)]
 
-    # Save
-    import os
-    os.makedirs('results', exist_ok=True)
+    for K in [5, 10, 20, 50]:
+        print(f"\n{'='*60}\n  K = {K}\n{'='*60}")
+        for bs, n_test, repeat in configs:
+            for method in methods:
+                # 'ours' also gets a streaming-backbone variant -> O(1) peak memory
+                variants = [False, True] if method == 'ours' else [False]
+                for stream in variants:
+                    tag = method + ('-stream' if stream else '')
+                    try:
+                        r = measure_inference(method, K, n_test=n_test, bs=bs,
+                                              repeat=repeat, stream=stream)
+                    except RuntimeError as e:
+                        if 'out of memory' in str(e).lower():
+                            print(f"  {tag:>14s} [bs={bs:>3d}]: OOM at K={K}")
+                            torch.cuda.empty_cache()
+                            r = {'method': method, 'K': K, 'bs': bs, 'stream': stream,
+                                 'ms_per_img': -1, 'throughput_img_s': -1,
+                                 'gpu_peak_mb': -1, 'upload_mb': -1}
+                        else:
+                            raise
+                    if r.get('ms_per_img', -1) >= 0:
+                        print(f"  {tag:>14s} [bs={bs:>3d}]: "
+                              f"{r['ms_per_img']:7.3f} ms/img, {r['throughput_img_s']:8.0f} img/s, "
+                              f"mem={r['gpu_peak_mb']:7.1f}MB, up={r['upload_mb']:7.1f}MB")
+                    results.append(r)
+            torch.cuda.empty_cache()
+
     json.dump(results, open('results/efficiency_measurements.json', 'w'), indent=2)
-    print(f"\nSaved: results/efficiency_measurements.json")
+    print(f"\nSaved: results/efficiency_measurements.json ({len(results)} rows)")
