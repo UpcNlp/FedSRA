@@ -113,6 +113,37 @@ def oracle_seen_acc(fz, valid, ccc, etf, labels, NL, FD):
     return float((logits.argmax(1).numpy() == labels).mean())
 
 
+def acc_perclass(fz, valid, ccc, etf, labels, NL, FD, mode='seen', thr=SEEN_THR):
+    """Per-class reliability routing from per-class counts n_{k,c} (NO labels).
+    For each candidate class c, aggregate with a per-class weight a_{k,c} and score by
+    cosine to e_c; predict argmax_c. This is the deployable approximation of the
+    seen-only oracle, and REQUIRES per-class counts (uniform / n_k / |S_k| cannot do it).
+      mode='seen'  : a_{k,c} = sqrt(n_k) if n_{k,c}>=thr else 0   (hard per-class mask)
+      mode='sqrt'  : a_{k,c} = sqrt(n_{k,c})                      (soft, continuous)
+      mode='linear': a_{k,c} = n_{k,c}
+    """
+    N = len(labels)
+    En = F.normalize(etf, dim=1)                      # [C, FD]
+    scores = torch.full((N, NL), -1e9)
+    for c in range(NL):
+        vc, wsum = None, 0.0
+        for k in valid:
+            nkc = ccc.get(k, {}).get(c, 0)
+            if mode == 'seen':
+                a = float(np.sqrt(sum(ccc[k].values()))) if nkc >= thr else 0.0
+            elif mode == 'sqrt':
+                a = float(np.sqrt(nkc))
+            else:  # linear
+                a = float(nkc)
+            if a == 0.0:
+                continue
+            vc = fz[k] * a if vc is None else vc + fz[k] * a
+            wsum += a
+        if vc is not None:
+            scores[:, c] = F.normalize(vc / max(wsum, 1e-12), dim=1) @ En[c]
+    return float((scores.argmax(1).numpy() == labels).mean())
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--alpha', type=float, required=True)
@@ -145,22 +176,31 @@ def main():
     for p in (0.1, 0.2):
         m, sd = noisy_coverage_acc(fz, valid, ccc, etf, labels, NL, p)
         noisy[f'coverage_noisy{int(p*100)}'] = {'mean': m, 'std': sd}
+    # per-class reliability routing from n_{k,c} (label-free oracle approximation)
+    perclass = {f'perclass_{m}': acc_perclass(fz, valid, ccc, etf, labels, NL, FD, mode=m)
+                for m in ('seen', 'sqrt', 'linear')}
     oracle = oracle_seen_acc(fz, valid, ccc, etf, labels, NL, FD)
 
     print(f"\n[{args.dataset}] alpha={args.alpha} K={NC} | clients {len(valid)}/{NC}")
+    print("  per-client scalar weights:")
     for s in schemes:
         star = "  <- deployed method" if s == 'sqrt_count' else (
                "  <- paper's stated prior" if s == 'coverage' else "")
         print(f"    {s:18s}: {acc[s]*100:6.2f}%{star}")
+    print("  per-class routing from n_{k,c} (label-free):")
+    for kk, v in perclass.items():
+        print(f"    {kk:18s}: {v*100:6.2f}%")
+    print("  noisy-metadata robustness (coverage weight):")
     for kk, v in noisy.items():
         print(f"    {kk:18s}: {v['mean']*100:6.2f}% (+/-{v['std']*100:.2f})")
-    print(f"    {'oracle (seen)':18s}: {oracle*100:6.2f}%  <- upper bound")
+    print(f"    {'oracle (seen)':18s}: {oracle*100:6.2f}%  <- upper bound (uses labels)")
 
     out = args.out or f"results/metaw_{args.dataset}_a{args.alpha}_k{NC}_s{args.seed}.json"
     os.makedirs(os.path.dirname(out) or '.', exist_ok=True)
     json.dump({
         'dataset': args.dataset, 'alpha': args.alpha, 'K': NC, 'seed': args.seed,
-        'n_clients': len(valid), 'acc': acc, 'noisy': noisy, 'oracle': oracle,
+        'n_clients': len(valid), 'acc': acc, 'perclass': perclass,
+        'noisy': noisy, 'oracle': oracle,
     }, open(out, 'w'), indent=2)
     print(f"  saved {out}")
 
