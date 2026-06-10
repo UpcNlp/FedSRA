@@ -17,6 +17,10 @@ so the accuracies are directly comparable:
   frozen  : per-client mean/std estimated ONCE from a small unlabeled calibration
             pool, then frozen and applied per-sample. Batch-size independent --
             the robust deployment we propose.
+  sorted  : with --stream sorted, the eval stream is ordered by class label before
+            chunking -- the worst-case composition for batch-B stats (a batch is
+            dominated by few classes, so the per-batch mean absorbs the class
+            signal itself). frozen stats are order-independent by construction.
 
 Feature extraction (the only GPU-heavy step) runs once; the B sweep is pure
 re-aggregation on cached features, so the whole experiment is cheap.
@@ -88,6 +92,9 @@ def main():
     ap.add_argument('--FD', type=int, default=256)
     ap.add_argument('--calib_n', type=int, default=1024,
                     help='size of the unlabeled calibration pool for frozen stats')
+    ap.add_argument('--stream', default='random', choices=['random', 'sorted'],
+                    help='serving-stream order: random (i.i.d. batches) or sorted '
+                         'by class (worst-case class-skewed batches)')
     ap.add_argument('--out', default=None)
     args = ap.parse_args()
     torch.manual_seed(args.seed); np.random.seed(args.seed)
@@ -109,13 +116,16 @@ def main():
     perm = np.random.RandomState(args.seed).permutation(N)
     calib_idx = perm[:args.calib_n]
     eval_idx = perm[args.calib_n:]
+    if args.stream == 'sorted':
+        # class-sorted stream: worst case for per-batch statistics
+        eval_idx = eval_idx[np.argsort(labels[eval_idx], kind='stable')]
     ne = len(eval_idx)
 
     Bs = [b for b in (1, 8, 32, 128, 512) if b < ne] + [ne]   # B=ne == global full-test stats
     batch_acc = {B: acc_batch(all_raw, valid, w, etf, labels, eval_idx, B) for B in Bs}
     frozen = acc_frozen(all_raw, valid, w, etf, labels, eval_idx, calib_idx)
 
-    print(f"\n[{args.dataset}] alpha={args.alpha} K={NC} | eval_n={ne} "
+    print(f"\n[{args.dataset}] alpha={args.alpha} K={NC} stream={args.stream} | eval_n={ne} "
           f"calib_n={len(calib_idx)} | clients {len(valid)}/{NC}")
     print("  per-batch-stats z-score (naive streaming):")
     for B in Bs:
@@ -123,10 +133,12 @@ def main():
         print(f"    {tag:>15s}: {batch_acc[B] * 100:6.2f}%")
     print(f"  frozen-calib z-score (any B):  {frozen * 100:6.2f}%")
 
-    out = args.out or f"results/batchz_{args.dataset}_a{args.alpha}_k{NC}_s{args.seed}.json"
+    sfx = '_sorted' if args.stream == 'sorted' else ''
+    out = args.out or f"results/batchz{sfx}_{args.dataset}_a{args.alpha}_k{NC}_s{args.seed}.json"
     os.makedirs(os.path.dirname(out) or '.', exist_ok=True)
     json.dump({
         'dataset': args.dataset, 'alpha': args.alpha, 'K': NC, 'seed': args.seed,
+        'stream': args.stream,
         'eval_n': int(ne), 'calib_n': int(len(calib_idx)),
         'batch_acc': {str(B): batch_acc[B] for B in Bs},
         'global_acc': batch_acc[ne],
