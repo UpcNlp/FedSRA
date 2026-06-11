@@ -118,7 +118,7 @@ def main():
         if not mask.any(): continue
         mt = torch.as_tensor(mask)
         of[mt] += Z[k][mt] * w[k]; ow[mask] += w[k]
-    zo = F.normalize(of / torch.as_tensor(np.maximum(ow, 1e-12))[:, None], dim=1)
+    zo = F.normalize(of / torch.as_tensor(np.maximum(ow, 1e-12), dtype=torch.float32)[:, None], dim=1)
     oracle_acc = float(((zo @ etf.T).argmax(1).numpy() == le).mean())
 
     # headline: cheapest tau within 0.5 pp of full accuracy
