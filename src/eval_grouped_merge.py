@@ -95,7 +95,7 @@ def main():
             fz = torch.nan_to_num((f[et] - mu) / (sd + EPS), nan=0.0, posinf=0.0, neginf=0.0)
             agg = fz * w if agg is None else agg + fz * w; wsum += w
         z = F.normalize(agg / max(wsum, 1e-12), dim=1)
-        return float((z @ etf.T).argmax(1).numpy() == le).mean()
+        return float(((z @ etf.T).argmax(1).numpy() == le).mean())
 
     # shared eval split (computed once labels are known)
     rows = []
