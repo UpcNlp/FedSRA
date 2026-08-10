@@ -47,11 +47,54 @@ def save_models(bbs, client_exps, ccc, arch_names, save_dir):
     print(f"  saved -> {save_dir}")
 
 
+def _atomic_torch_save(obj, path):
+    """Write a checkpoint atomically so an interrupted job cannot look complete."""
+    tmp = f"{path}.tmp.{os.getpid()}"
+    torch.save(obj, tmp)
+    os.replace(tmp, path)
+
+
+def save_client(k, bb, exps, save_dir):
+    """Persist one fully trained client immediately (backbone + every expert)."""
+    cd = os.path.join(save_dir, f"client_{k}")
+    os.makedirs(cd, exist_ok=True)
+    _atomic_torch_save(bb.state_dict(), os.path.join(cd, "backbone.pt"))
+    for c, exp in exps.items():
+        _atomic_torch_save(exp.state_dict(), os.path.join(cd, f"expert_{c}.pt"))
+    marker = os.path.join(cd, "COMPLETE.json")
+    tmp = f"{marker}.tmp.{os.getpid()}"
+    with open(tmp, "w") as f:
+        json.dump({'client': k, 'n_experts': len(exps)}, f, indent=2)
+    os.replace(tmp, marker)
+
+
+def load_client(k, arch_name, save_dir, NL, FD=256):
+    cd = os.path.join(save_dir, f"client_{k}")
+    bb = make_backbone(arch_name, FD)
+    bb.load_state_dict(torch.load(os.path.join(cd, "backbone.pt"),
+                                  map_location='cpu', weights_only=True))
+    exps = {}
+    for c in range(NL):
+        ep = os.path.join(cd, f"expert_{c}.pt")
+        if os.path.exists(ep):
+            exp = ConditionalExpert(FD, FD, 128, 32)
+            exp.load_state_dict(torch.load(ep, map_location='cpu', weights_only=True))
+            exps[c] = exp
+    return bb, exps
+
+
 def all_ckpts_exist(save_dir, NC):
     if not os.path.exists(os.path.join(save_dir, "arch_map.json")):
         return False
+    # New resumable runs use per-client terminal markers.  Legacy completed runs
+    # have no markers, so retain backward compatibility only when none exist.
+    has_markers = any(os.path.exists(os.path.join(save_dir, f"client_{k}", "COMPLETE.json"))
+                      for k in range(NC))
     for k in range(NC):
         if not os.path.exists(os.path.join(save_dir, f"client_{k}", "backbone.pt")):
+            return False
+        if has_markers and not os.path.exists(
+                os.path.join(save_dir, f"client_{k}", "COMPLETE.json")):
             return False
     return True
 
@@ -86,6 +129,10 @@ def main():
     ap.add_argument('--seed', type=int, default=42)
     ap.add_argument('--resume', action='store_true')
     ap.add_argument('--smoke', action='store_true')
+    ap.add_argument('--save_dir', default=None,
+                    help='checkpoint directory override (recommended for versioned runs)')
+    ap.add_argument('--out', default=None,
+                    help='result JSON override (recommended for versioned runs)')
     args = ap.parse_args()
 
     DS = args.dataset; TIER = args.tier; ALPHA = args.alpha; SEED = args.seed
@@ -102,7 +149,7 @@ def main():
 
     tag = f"hetero_{DS}_{TIER}_a{ALPHA}_s{SEED}"
     suffix = "_smoke" if args.smoke else ""
-    save_dir = f"saved_models/{tag}{suffix}"
+    save_dir = args.save_dir or f"saved_models/{tag}{suffix}"
     print(f"\n{'='*64}\n  {tag}{suffix}  archs={arch_names}\n  NL={NL} EPB={EPB} EPE={EPE}\n{'='*64}")
 
     etf = generate_etf(NL, FD)
@@ -110,6 +157,20 @@ def main():
         cal, ccl, tl, ccc = prepare_data(NC, ALPHA, NL)
     else:
         cal, ccl, tl, ccc = prepare_data_cifar100(NC, ALPHA, NL)
+
+    # Save immutable run structure before any expensive training.  COMPLETE.json is
+    # written per client only after its backbone and all available experts are safe.
+    os.makedirs(save_dir, exist_ok=True)
+    arch_path = os.path.join(save_dir, "arch_map.json")
+    if os.path.exists(arch_path):
+        old_arch = json.load(open(arch_path))
+        if old_arch != arch_names:
+            raise RuntimeError(f"architecture mismatch in {arch_path}: {old_arch} != {arch_names}")
+    else:
+        json.dump(arch_names, open(arch_path, "w"), indent=2)
+    ccc_path = os.path.join(save_dir, "ccc.pt")
+    if not os.path.exists(ccc_path):
+        _atomic_torch_save(dict(ccc), ccc_path)
 
     if args.resume and all_ckpts_exist(save_dir, NC):
         bbs, client_exps, ccc, arch_names = load_models(save_dir, NC, NL, FD)
@@ -122,6 +183,12 @@ def main():
             cls = sorted(ccc.get(k, {}).keys())
             if not cls:
                 print(f"  Client {k}: EMPTY"); bbs.append(None); client_exps.append({}); continue
+            marker = os.path.join(save_dir, f"client_{k}", "COMPLETE.json")
+            if args.resume and os.path.exists(marker):
+                bb, exps = load_client(k, arch_names[k], save_dir, NL, FD)
+                bbs.append(bb); client_exps.append(exps)
+                print(f"  [resume] Client {k}: loaded backbone + {len(exps)} experts")
+                continue
             print(f"\n  Client {k} [{arch_names[k]}]: {len(cls)} cls, {sum(ccc[k].values())} samp")
             bb = make_backbone(arch_names[k], FD)
             bb = train_bb(bb, cal[k], cls, etf, EPB)
@@ -132,6 +199,8 @@ def main():
                                                nc=NL, fdim=FD, ldim=LD, epochs=EPE)
             bbs.append(bb.cpu())
             client_exps.append({c: e.cpu() for c, e in exps.items()})
+            save_client(k, bbs[-1], client_exps[-1], save_dir)
+            print(f"  [checkpoint] Client {k}: backbone + {len(exps)} experts")
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
         train_time = time.time() - t0
@@ -231,7 +300,8 @@ def main():
         'acc_dynamic': float(acc_dyn), 'af_dynamic': round(float(af_dyn), 4),
         'avg_coverage': round(float(coverage.mean()), 4), 'smoke': args.smoke,
     }
-    path = f"results/{tag}{suffix}.json"
+    path = args.out or f"results/{tag}{suffix}.json"
+    os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
     json.dump(out, open(path, 'w'), indent=2)
     print(f"  saved: {path}")
 
