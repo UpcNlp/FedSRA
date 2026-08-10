@@ -68,6 +68,27 @@ def collect(results_dir: Path) -> Tuple[pd.DataFrame, List[str]]:
                         for metric in METRICS:
                             record[metric] = metric_values.get(metric, np.nan)
                         records.append(record)
+                    if heldout == "none":
+                        participating = payload.get("clients", ["brset", "mbrset", "odir"])
+                        per_source = [
+                            payload["evaluation"][source][variant]["balanced_accuracy"]
+                            for source in participating
+                        ]
+                        record = {
+                            "setting": "three-source",
+                            "heldout": heldout,
+                            "method": display_name,
+                            "base_method": method,
+                            "variant": variant,
+                            "seed": seed,
+                            "domain": "worst-source",
+                            "elapsed_s": payload.get("elapsed_s", np.nan),
+                            "gpu_peak_mb": payload.get("gpu_peak_mb", np.nan),
+                        }
+                        for metric in METRICS:
+                            record[metric] = np.nan
+                        record["balanced_accuracy"] = min(per_source)
+                        records.append(record)
     return pd.DataFrame(records), missing
 
 
@@ -135,6 +156,37 @@ def markdown_table(summary: pd.DataFrame, setting: str, domain: str) -> str:
     return "\n".join(lines)
 
 
+def per_domain_ba_table(summary: pd.DataFrame) -> str:
+    domains = ("brset", "mbrset", "odir", "pooled", "worst-source")
+    if summary.empty:
+        return "No completed three-source rows."
+    selected = summary.loc[summary["setting"] == "three-source"].copy()
+    if selected.empty:
+        return "No completed three-source rows."
+    lines = [
+        "| Method | BRSET | mBRSET | ODIR-5K | Pooled | Worst source |",
+        "|---|---:|---:|---:|---:|---:|",
+    ]
+    for method in selected["method"].drop_duplicates():
+        fields = []
+        method_rows = selected.loc[selected["method"] == method]
+        for domain in domains:
+            rows = method_rows.loc[method_rows["domain"] == domain]
+            if rows.empty:
+                fields.append("--")
+                continue
+            row = rows.iloc[0]
+            fields.append(
+                format_pm(
+                    row["balanced_accuracy_mean"],
+                    row["balanced_accuracy_std"],
+                    int(row["n_seeds"]),
+                )
+            )
+        lines.append(f"| {method} | " + " | ".join(fields) + " |")
+    return "\n".join(lines)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--results", type=Path, required=True)
@@ -154,6 +206,10 @@ def main() -> None:
             "## Three-source cross-silo, pooled test",
             "",
             markdown_table(summary, "three-source", "pooled"),
+            "",
+            "## Three-source balanced accuracy by source",
+            "",
+            per_domain_ba_table(summary),
             "",
             "## Held-out mBRSET domain shift, mBRSET test",
             "",
