@@ -12,7 +12,11 @@ from pathlib import Path
 SEEDS = (0, 42, 123)
 DOMAINS = ("brset", "mbrset", "odir", "pooled")
 METHODS = {
-    "fedsra": ("rga_client_local_moments",),
+    "fedsra": (
+        "rga_client_local_moments",
+        "rga_full_batch_diagnostic",
+        "rga_per_sample_layernorm",
+    ),
     "ce": (
         "one_shot_fedavg",
         "uniform_logit_ensemble",

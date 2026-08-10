@@ -2,8 +2,8 @@
 """Real-source cross-silo fundus experiment for the FedSRA rebuttal.
 
 The three clinical sources are the clients: BRSET, mBRSET, and ODIR-5K.  The
-shared single-label task is binary diabetic-retinopathy recognition.  Official
-patient-disjoint train/validation/test splits are preserved.  Two independently
+shared single-label task is binary diabetes-related retinal-disease recognition. Precomputed
+60/20/20 patient-disjoint train/validation/test splits are fixed across methods. Two independently
 trained methods are supported:
 
 * ``fedsra``: ImageNet-initialized ResNet-18 clients with a fixed binary ETF,
@@ -182,6 +182,9 @@ def load_sources(root: Path) -> Dict[str, pd.DataFrame]:
         )
         frame["_label"] = frame[spec["label"]].astype(int)
         frame["_patient"] = frame[spec["patient"]].astype(str)
+        if frame["_path"].duplicated().any():
+            duplicate = frame.loc[frame["_path"].duplicated(), "_path"].iloc[0]
+            raise ValueError(f"{source}: duplicate image path, e.g. {duplicate}")
         missing = [p for p in frame["_path"] if not Path(p).is_file()]
         if missing:
             raise FileNotFoundError(f"{source}: {len(missing)} missing images, e.g. {missing[0]}")
@@ -193,7 +196,7 @@ def load_sources(root: Path) -> Dict[str, pd.DataFrame]:
             split_patients[a] & split_patients[b]
             for a, b in (("train", "val"), ("train", "test"), ("val", "test"))
         ):
-            raise ValueError(f"{source}: patient leakage across official splits")
+            raise ValueError(f"{source}: patient leakage across configured splits")
         result[source] = frame
     return result
 

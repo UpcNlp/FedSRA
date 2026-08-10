@@ -13,7 +13,11 @@ import pandas as pd
 
 
 VARIANTS: Dict[str, List[Tuple[str, str]]] = {
-    "fedsra": [("FedSRA", "rga_client_local_moments")],
+    "fedsra": [
+        ("FedSRA (local moments)", "rga_client_local_moments"),
+        ("FedSRA (full-batch diagnostic)", "rga_full_batch_diagnostic"),
+        ("FedSRA (per-sample LN)", "rga_per_sample_layernorm"),
+    ],
     "ce": [
         ("O-FedAvg", "one_shot_fedavg"),
         ("CE ensemble", "uniform_logit_ensemble"),

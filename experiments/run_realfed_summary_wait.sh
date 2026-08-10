@@ -29,6 +29,8 @@ while true; do
 done
 
 cd "$ROOT"
+"$PY" review_response/experiments/validate_realfed_results.py \
+  --results "$OUT/results"
 "$PY" review_response/experiments/summarize_realfed.py \
   --results "$OUT/results" --output "$SUMMARY"
 echo "[$(date '+%F %T')] summary complete: $SUMMARY"
