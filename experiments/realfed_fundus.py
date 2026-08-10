@@ -253,13 +253,21 @@ def binary_metrics(logits: torch.Tensor, labels: np.ndarray) -> Dict[str, float]
     }
 
 
-def average_models(models_in: Sequence[nn.Module]) -> nn.Module:
+def average_models(
+    models_in: Sequence[nn.Module], sample_counts: np.ndarray
+) -> nn.Module:
+    """Sample-size-weighted one-shot FedAvg over identically initialized clients."""
     averaged = copy.deepcopy(models_in[0]).cpu()
     states = [m.cpu().state_dict() for m in models_in]
+    weights = torch.as_tensor(sample_counts, dtype=torch.float64)
+    weights = weights / weights.sum()
     merged = {}
     for key, first in states[0].items():
         if first.is_floating_point():
-            merged[key] = torch.stack([s[key].float() for s in states]).mean(0).to(first.dtype)
+            merged[key] = sum(
+                float(weight) * state[key].float()
+                for weight, state in zip(weights, states)
+            ).to(first.dtype)
         else:
             merged[key] = first.clone()
     averaged.load_state_dict(merged)
@@ -369,12 +377,19 @@ def load_or_train_ce(
     workers: int,
     lr: float,
     save_every: int,
+    initial_state: Optional[Dict[str, torch.Tensor]],
 ) -> Tuple[CEModel, Dict[str, object]]:
-    model = CEModel(cfg.feature_dim, pretrained=not checkpoint.exists())
+    model = CEModel(
+        cfg.feature_dim,
+        pretrained=not checkpoint.exists() and initial_state is None,
+    )
     if checkpoint.exists():
         saved = torch.load(checkpoint, map_location="cpu", weights_only=False)
         model.load_state_dict(saved["model"])
         return model, saved["meta"]
+    if initial_state is None:
+        raise ValueError("CE clients require a shared initialization for one-shot FedAvg")
+    model.load_state_dict(initial_state)
     model.to(device)
     ds = FundusDataset(train_rows, build_transform(cfg.image_size, True))
     loader = make_loader(ds, batch_size, workers, train=True, balanced=True)
@@ -477,11 +492,11 @@ def ce_logits(
         "uniform_logit_ensemble": torch.stack(logits_all).mean(0),
         "sqrt_weighted_logit_ensemble": sum(float(w) * x for w, x in zip(weights, logits_all)),
     }
-    averaged = average_models(models_in).to(device).eval()
+    averaged = average_models(models_in, sample_counts).to(device).eval()
     outs = []
     for x, _ in loader:
         outs.append(averaged(x.to(device, non_blocking=True)).float().cpu())
-    result["one_shot_parameter_average"] = torch.cat(outs)
+    result["one_shot_fedavg"] = torch.cat(outs)
     return result, labels
 
 
@@ -525,6 +540,17 @@ def main() -> None:
     start = time.time()
     checkpoint_dir = args.output / "checkpoints" / cfg.tag
     etf = generate_etf(2, cfg.feature_dim, 42)
+    ce_initial_state = None
+    if cfg.method == "ce":
+        # O-FedAvg is only well-defined when every local optimizer starts from
+        # exactly the same model.  The per-client seeds below affect sampling
+        # and augmentation, not the shared initialization.
+        initial_model = CEModel(cfg.feature_dim, pretrained=True)
+        ce_initial_state = {
+            key: value.detach().cpu().clone()
+            for key, value in initial_model.state_dict().items()
+        }
+        del initial_model
     trained = []
     moments = []
     metas = []
@@ -538,7 +564,18 @@ def main() -> None:
             model, mu, sd, meta = load_or_train_fedsra(source, cfg, rows, etf, checkpoint, device, args.batch_size, args.workers, args.lr, args.save_every)
             moments.append((mu, sd))
         else:
-            model, meta = load_or_train_ce(source, cfg, rows, checkpoint, device, args.batch_size, args.workers, args.lr, args.save_every)
+            model, meta = load_or_train_ce(
+                source,
+                cfg,
+                rows,
+                checkpoint,
+                device,
+                args.batch_size,
+                args.workers,
+                args.lr,
+                args.save_every,
+                ce_initial_state,
+            )
         trained.append(model)
         metas.append(meta)
     evaluations = {}
@@ -554,7 +591,7 @@ def main() -> None:
         else:
             outputs, labels = ce_logits(trained, np.asarray(sample_counts), loader, device)
         evaluations[domain] = {name: binary_metrics(logits, labels) for name, logits in outputs.items()}
-    primary = "rga_client_local_moments" if cfg.method == "fedsra" else "one_shot_parameter_average"
+    primary = "rga_client_local_moments" if cfg.method == "fedsra" else "one_shot_fedavg"
     participating = cfg.clients
     worst_domain = min(evaluations[d][primary]["balanced_accuracy"] for d in participating)
     result = {
