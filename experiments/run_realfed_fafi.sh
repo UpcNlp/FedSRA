@@ -24,7 +24,7 @@ run_one() {
     "$PY" -u "$SCRIPT" \
       --data_root "$ROOT/realfed_data" --output "$OUT" \
       --seed "$seed" --epochs 30 --image_size 224 --batch_size 32 \
-      --workers 2 --lr 1e-4 --save_every 5 \
+      --workers 8 --lr 1e-4 --save_every 5 \
       > "$OUT/logs/${tag}.log" 2>&1
   echo "[$(date '+%F %T')] [g${gpu}] done ${tag}"
 }

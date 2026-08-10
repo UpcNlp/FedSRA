@@ -39,7 +39,7 @@ run_cell () {
     $PY -u "$SCRIPT" \
       --method "$method" --data_root "$DATA" --output "$OUT" \
       --seed "$seed" --epochs 30 --image_size 224 --batch_size 64 \
-      --workers 2 --lr 1e-4 --save_every 5 \
+      --workers 4 --lr 1e-4 --save_every 5 \
       > "$log" 2>&1
   local rc=$?
   echo "[$(date '+%F %T')] [g$gpu] finish $tag rc=$rc"

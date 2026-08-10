@@ -14,23 +14,23 @@ cd "$ROOT"
 
 run_one() {
   local gpu=$1 seed=$2
-  local tag="realfed_binary_ce_heldout-none_s${seed}"
+  local tag="realfed_binary_fedsra_heldout-none_s${seed}"
   if [[ -f "$OUT/results/${tag}.json" ]]; then
     echo "[$(date '+%F %T')] [g${gpu}] skip complete ${tag}"
     return
   fi
-  echo "[$(date '+%F %T')] [g${gpu}] start ${tag}"
+  echo "[$(date '+%F %T')] [g${gpu}] resume ${tag}"
   CUDA_VISIBLE_DEVICES=$gpu HIP_VISIBLE_DEVICES=$gpu \
     "$PY" -u "$SCRIPT" \
-      --method ce --data_root "$ROOT/realfed_data" --output "$OUT" \
+      --method fedsra --data_root "$ROOT/realfed_data" --output "$OUT" \
       --seed "$seed" --epochs 30 --image_size 224 --batch_size 64 \
       --workers 4 --lr 1e-4 --save_every 5 \
       > "$OUT/logs/${tag}.log" 2>&1
   echo "[$(date '+%F %T')] [g${gpu}] done ${tag}"
 }
 
-run_one 3 0 &
-run_one 4 42 &
-run_one 5 123 &
+run_one 0 0 &
+run_one 1 42 &
+run_one 2 123 &
 wait
-echo "[$(date '+%F %T')] CE core complete"
+echo "[$(date '+%F %T')] FedSRA core complete"

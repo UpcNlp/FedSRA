@@ -45,14 +45,14 @@ run_one() {
       "$PY" -u "$ROOT/review_response/experiments/realfed_fafi.py" \
         --data_root "$ROOT/realfed_data" --output "$OUT" \
         --seed "$seed" --epochs 30 --image_size 224 --batch_size 32 \
-        --workers 2 --lr 1e-4 --save_every 5 --heldout mbrset \
+        --workers 8 --lr 1e-4 --save_every 5 --heldout mbrset \
         > "$OUT/logs/${tag}.log" 2>&1
   else
     CUDA_VISIBLE_DEVICES=$gpu HIP_VISIBLE_DEVICES=$gpu \
       "$PY" -u "$ROOT/review_response/experiments/realfed_fundus.py" \
         --method "$method" --data_root "$ROOT/realfed_data" --output "$OUT" \
         --seed "$seed" --epochs 30 --image_size 224 --batch_size 64 \
-        --workers 2 --lr 1e-4 --save_every 5 --heldout mbrset \
+        --workers 4 --lr 1e-4 --save_every 5 --heldout mbrset \
         > "$OUT/logs/${tag}.log" 2>&1
   fi
   echo "[$(date '+%F %T')] [g${gpu}] done ${tag}"
