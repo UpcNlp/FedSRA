@@ -46,7 +46,7 @@ run_one() {
     "$PY" -u "$SCRIPT" \
       --data_root "$ROOT/realfed_data" --output "$OUT" \
       --teacher_output "$OUT" --seed "$seed" --epochs 200 \
-      --image_size 224 --synth_size 128 --batch_size 64 --g_steps 30 \
+      --image_size 224 --synth_size 64 --batch_size 32 --g_steps 30 \
       --kd_lr 0.01 --lr_g 1e-3 --kd_temperature 4 \
       --save_every 5 --workers 2 \
       > "$OUT/logs/${tag}.log" 2>&1

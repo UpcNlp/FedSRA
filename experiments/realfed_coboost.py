@@ -5,7 +5,7 @@ The script consumes the CE client checkpoints produced by
 ``realfed_fundus.py`` and retains the official Co-Boosting synthesizer,
 ensemble-weight adaptation, hard-sample loss, ODS perturbation, and data-free
 KL distillation.  Synthetic images are generated at a configurable lower
-resolution (128 by default) because ResNet-18 is fully convolutional; all real
+resolution (64 by default) because ResNet-18 is fully convolutional; all real
 validation/test images remain at the shared 224-pixel evaluation resolution.
 """
 
@@ -195,7 +195,7 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--epochs", type=int, default=200)
     parser.add_argument("--image_size", type=int, default=224)
-    parser.add_argument("--synth_size", type=int, default=128)
+    parser.add_argument("--synth_size", type=int, default=64)
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--g_steps", type=int, default=30)
     parser.add_argument("--kd_lr", type=float, default=0.01)
