@@ -12,6 +12,7 @@ validation/test images remain at the shared 224-pixel evaluation resolution.
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import logging
 import sys
@@ -50,9 +51,21 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 COBOOST_ROOT = REPO_ROOT / "Co-Boosting-main"
 sys.path.insert(0, str(COBOOST_ROOT))
 import datafree  # noqa: E402
-from datafree.models.generator import Generator  # noqa: E402
 from datafree.synthesis.coboost import COBOOSTSynthesizer  # noqa: E402
 from utils_fl import WEnsemble  # noqa: E402
+
+# Importing ``datafree.models`` executes every legacy classifier module, one of
+# which depends on the removed ``torchvision.models.utils`` namespace.  Load
+# the official generator source directly so that unrelated legacy models do
+# not prevent the current baseline from running on modern torchvision.
+_generator_spec = importlib.util.spec_from_file_location(
+    "coboost_official_generator", COBOOST_ROOT / "datafree/models/generator.py"
+)
+if _generator_spec is None or _generator_spec.loader is None:
+    raise ImportError("Could not load the official Co-Boosting generator")
+_generator_module = importlib.util.module_from_spec(_generator_spec)
+_generator_spec.loader.exec_module(_generator_module)
+Generator = _generator_module.Generator
 
 
 @dataclass(frozen=True)
