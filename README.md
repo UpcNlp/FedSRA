@@ -87,7 +87,14 @@ python experiments/ncsweep_medmnist.py   --dataset pathmnist --data data/medmnis
 
 ## Baselines
 
-We do not redistribute baseline code (see `docs/BASELINE_PROVENANCE.md`): each
-baseline links to its official repository, and we ship only our adapter. Adapters
-change only the backbone and data handling for a fair comparison; every
-method-specific objective and server procedure is unchanged.
+Baselines live in `baselines/` as git submodules pinned to the exact upstream
+commit we ran (we reference the official code, we do not redistribute it). Fetch
+them with:
+
+```bash
+git submodule update --init --recursive
+```
+
+Our adapters (in `experiments/`) change only the backbone and data handling for a
+fair comparison; every method-specific objective and server procedure is
+unchanged. See `baselines/README.md` and `docs/BASELINE_PROVENANCE.md`.

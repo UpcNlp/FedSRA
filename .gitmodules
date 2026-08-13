@@ -1,0 +1,15 @@
+[submodule "baselines/FAFI"]
+	path = baselines/FAFI
+	url = https://github.com/zenghui9977/FAFI_ICML25
+[submodule "baselines/Co-Boosting"]
+	path = baselines/Co-Boosting
+	url = https://github.com/rong-dai/Co-Boosting
+[submodule "baselines/FuseFL"]
+	path = baselines/FuseFL
+	url = https://github.com/wizard1203/FuseFL
+[submodule "baselines/FedCGS"]
+	path = baselines/FedCGS
+	url = https://github.com/Yuqin-G/FedCGS
+[submodule "baselines/IntactOFL"]
+	path = baselines/IntactOFL
+	url = https://github.com/zenghui9977/IntactOFL
