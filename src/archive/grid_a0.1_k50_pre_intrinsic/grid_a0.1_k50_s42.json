@@ -1,8 +1,0 @@
-{
-  "alpha": 0.1,
-  "n_clients": 50,
-  "seed": 42,
-  "acc_relational": 0.2741,
-  "acc_intrinsic": null,
-  "gap": null
-}
