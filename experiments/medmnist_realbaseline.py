@@ -57,7 +57,7 @@ from medmnist_fedsra import (
     state_to_fp16_cpu,
 )
 
-FAFI_ROOT = Path(__file__).resolve().parents[2] / "FAFI_ICML25-master-orgin"
+FAFI_ROOT = Path(__file__).resolve().parents[1] / "baselines" / "FAFI"
 sys.path.insert(0, str(FAFI_ROOT))
 from oneshot_algorithms.ours.unsupervised_loss import (  # noqa: E402
     Contrastive_proto_feature_loss,

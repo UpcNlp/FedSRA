@@ -50,9 +50,10 @@ from fedisic_fedsra import (
     per_center_audit,
 )
 
-# Official authors' objective, bundled in the repo (do not reimplement).
-REPO_ROOT = Path(__file__).resolve().parents[2]
-FAFI_ROOT = REPO_ROOT / "FAFI_ICML25-master-orgin"
+# Official authors' objective, referenced as the baselines/FAFI submodule
+# (do not reimplement). Run `git submodule update --init` first.
+REPO_ROOT = Path(__file__).resolve().parents[1]
+FAFI_ROOT = REPO_ROOT / "baselines" / "FAFI"
 sys.path.insert(0, str(FAFI_ROOT))
 from oneshot_algorithms.ours.unsupervised_loss import (  # noqa: E402
     Contrastive_proto_feature_loss,

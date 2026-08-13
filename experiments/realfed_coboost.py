@@ -47,8 +47,8 @@ from realfed_fundus import (
     subset_rows,
 )
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
-COBOOST_ROOT = REPO_ROOT / "Co-Boosting-main"
+REPO_ROOT = Path(__file__).resolve().parents[1]
+COBOOST_ROOT = REPO_ROOT / "baselines" / "Co-Boosting"
 sys.path.insert(0, str(COBOOST_ROOT))
 import datafree  # noqa: E402
 from datafree.synthesis.coboost import COBOOSTSynthesizer  # noqa: E402

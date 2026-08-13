@@ -47,8 +47,8 @@ from realfed_fundus import (
 
 # Import the objective directly from the published authors' code bundled in
 # this repository; do not silently reimplement or simplify the baseline.
-REPO_ROOT = Path(__file__).resolve().parents[2]
-FAFI_ROOT = REPO_ROOT / "FAFI_ICML25-master-orgin"
+REPO_ROOT = Path(__file__).resolve().parents[1]
+FAFI_ROOT = REPO_ROOT / "baselines" / "FAFI"
 sys.path.insert(0, str(FAFI_ROOT))
 from oneshot_algorithms.ours.unsupervised_loss import (  # noqa: E402
     Contrastive_proto_feature_loss,
