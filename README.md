@@ -13,7 +13,7 @@ src/            method + CIFAR/Tiny-ImageNet experiments (ETF, RGA, grouped-merg
                 scalability, R/I/J ablations, NC / residual diagnostics)
 experiments/    medical + natural-federation experiments (MedMNIST, Fed-ISIC2019)
 figures/        figure scripts and PDFs
-docs/           DATA.md, BASELINE_PROVENANCE.md, rebuttal/
+docs/           DATA.md, BASELINE_PROVENANCE.md, EXPERIMENTS.md
 ```
 
 ## Setup
@@ -47,7 +47,7 @@ python src/eval_residual_diag.py --dataset cifar100 --alpha 0.05 --K 10 --save_d
 python src/eval_grouped_merge_cost.py ...  # serving-cost / accuracy Pareto
 ```
 
-### Fed-ISIC2019 natural federation (rebuttal Table 2 + convergence) — `experiments/`
+### Fed-ISIC2019 natural federation — `experiments/`
 
 ```bash
 TR=data/Fed-ISIC2019/train-00000-of-00001.parquet
@@ -74,7 +74,7 @@ python experiments/medmnist_realbaseline.py --method fedsra --dataset pathmnist 
 # label noise: add --noise_rate 0.2 or 0.4
 ```
 
-### RGA mechanism / incomplete-NC diagnostics (rebuttal 1a/1b) — `experiments/`
+### RGA mechanism / incomplete-NC diagnostics — `experiments/`
 
 ```bash
 python experiments/residdiag_fedisic.py  --ckpt_dir out/fedisic/checkpoints/fedsra_s42 \

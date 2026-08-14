@@ -1,7 +1,7 @@
 # Baselines
 
 Each competing method is referenced as a **git submodule** pinned to the exact
-upstream commit we ran, so a reviewer gets the official code (not a copy we
+upstream commit we ran, so a reader gets the official code (not a copy we
 redistribute) plus our thin adapter against it. We never edit a submodule's
 source: the adapter imports the upstream objective and only swaps the backbone,
 the data pipeline, and the reporting so every method shares one protocol.

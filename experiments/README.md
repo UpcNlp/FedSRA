@@ -1,4 +1,4 @@
-# MedMNIST reviewer-response experiments
+# MedMNIST supplementary experiments
 
 The bundle is self-contained and is designed to be copied to a fresh directory on each
 RTX 5090 host. It reads the official MedMNIST `.npz` files directly and does not modify

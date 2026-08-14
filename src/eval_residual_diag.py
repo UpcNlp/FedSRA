@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 """
-A1 -- RGA noise-cancellation diagnostics (answers R2-D1/W1 and R3-W2).
+RGA noise-cancellation diagnostics.
 
 Inference only. Loads the FULL ETF backbones for one (dataset, alpha, K) cell,
 standardizes each client's features exactly as RGA does (per-feature z-score over
@@ -14,7 +14,7 @@ Per class c we measure, using the STANDARDIZED features h~_k:
                   zero-mean (assumption holds); large => systematic bias.
   bias_offtarget: max_{c'!=c} cos(mean_x h~_k(x), e_c') over unseen clients. Large =>
                   unseen clients systematically point class c at ANOTHER prototype
-                  (exactly the failure mode the reviewer describes: "cat -> dog").
+                  (a representative failure mode: "cat -> dog").
   rho_centered  : mean pairwise correlation of the RANDOM part of unseen residuals
                   (the Prop.1 rho; should be small for cancellation to work).
   rho_raw       : same but WITHOUT removing the bias (captures shared systematic

@@ -12,7 +12,7 @@ compare three ways to obtain the stats, all evaluated on the SAME held-out split
 so the accuracies are directly comparable:
 
   batch-B : stats computed WITHIN each incoming batch of B samples
-            (naive streaming -- the failure mode a reviewer will attack).
+            (naive streaming -- the failure mode of interest).
             B = eval_n reproduces the paper's "global" full-test-set number.
   frozen  : per-client mean/std estimated ONCE from a small unlabeled calibration
             pool, then frozen and applied per-sample. Batch-size independent --

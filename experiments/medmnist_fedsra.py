@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fresh reviewer-response experiments for FedSRA on MedMNIST.
+"""MedMNIST experiments for FedSRA.
 
 The script is intentionally self-contained so it can be copied to a clean directory on
 each RTX 5090 host. It trains independent ETF-anchored ResNet-18 client backbones, saves

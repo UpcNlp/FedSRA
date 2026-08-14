@@ -1,10 +1,10 @@
 """
-R1-D4 / R3-W7 -- quantitative multi-round vs one-shot comparison.
+Quantitative multi-round vs one-shot comparison.
 
 Implements a multi-round fixed-ETF federated method (the essence of FedETF/FedGELA:
 a frozen simplex-ETF classifier + FedAvg over the client backbones each round) and
 evaluates the single global backbone at rounds {1,3,5,10} by nearest-ETF prediction.
-This is the apples-to-apples multi-round ETF/NC baseline the reviewers ask for: under
+This is an apples-to-apples multi-round ETF/NC baseline: under
 the one-shot constraint (round 1) it has had no aggregation, and we show how many
 communication rounds it needs to approach FedSRA's one-shot accuracy.
 

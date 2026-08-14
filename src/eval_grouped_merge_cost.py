@@ -1,5 +1,5 @@
 """
-A2 -- grouped filter-merge with the FULL serving-cost vector R2-D2 asks for:
+Grouped filter-merge with the full serving-cost vector:
 accuracy, parameter count, merge/preprocessing time, peak GPU memory, and per-image
 latency at batch B=1 (online) and B=256 (throughput). Sweeps merge threshold thr and
 number of served models G on the SAME trained ETF backbones (inference only).

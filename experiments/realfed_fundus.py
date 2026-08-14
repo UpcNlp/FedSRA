@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Real-source cross-silo fundus experiment for the FedSRA rebuttal.
+"""Real-source cross-silo fundus experiment for FedSRA.
 
 The three clinical sources are the clients: BRSET, mBRSET, and ODIR-5K.  The
 shared single-label task is binary diabetes-related retinal-disease recognition. Precomputed

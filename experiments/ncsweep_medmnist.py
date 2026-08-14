@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Incomplete-NC degradation K-sweep on MedMNIST (2nd dataset for R1-D5).
+"""Incomplete-NC degradation K-sweep on MedMNIST.
 
 Trains K ETF clients, GPA-aggregates (per-client z-score + sqrt(n) weighted sum +
 post-L2), and computes the aggregated NC1/NC2 exactly as

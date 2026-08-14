@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""RGA noise-cancellation diagnostics on MedMNIST (answers R2-D1/W1, R3-W2).
+"""RGA noise-cancellation diagnostics on MedMNIST.
 
 Trains K ETF clients on an incomplete-coverage Dirichlet partition, then runs the
 same Proposition-1 residual diagnostics as ETF-pesuade/eval_residual_diag.py so the

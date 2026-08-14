@@ -3,7 +3,7 @@
 We do not redistribute baseline code: none of the baseline repositories we ran ship a
 license that permits redistribution. For each baseline we therefore link to its
 official repository at a pinned commit and ship only (i) our thin adapter and (ii) a
-`setup.sh` that clones the upstream code. This lets a reviewer verify the exact
+`setup.sh` that clones the upstream code. This lets a reader verify the exact
 official code we ran against our minimal diff.
 
 Every adapter changes only the backbone and data handling so that all methods share

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Aggregate completed RealFed cells into rebuttal-ready mean +/- std tables."""
+"""Aggregate completed RealFed cells into mean +/- std tables."""
 
 from __future__ import annotations
 
@@ -204,7 +204,7 @@ def main() -> None:
     raw.to_csv(raw_path, index=False)
     summary.to_csv(args.output, index=False)
 
-    report = ["# RealFed rebuttal summary", ""]
+    report = ["# RealFed summary", ""]
     report.extend(
         [
             "## Three-source cross-silo, pooled test",

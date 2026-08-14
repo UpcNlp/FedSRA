@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """Fed-ISIC2019 schema inspection + natural-skew GATE (CPU-only, seconds).
 
-Purpose (two jobs in one, per REBUTTAL_EXECUTION_SPEC.md 4.1):
+Purpose (two jobs in one):
   1. Print the parquet schema so the training script can be written against
      the *real* column names (image / label / center) with zero guesswork.
-  2. Measure the natural label skew across the 6 FLamby centers -- the GATE
-     that decides whether Fed-ISIC is a strong-skew in-regime dataset worth
-     betting the make-or-break on.
+  2. Measure the natural label skew across the 6 FLamby centers -- the check
+     that decides whether Fed-ISIC is a strong-skew in-regime dataset.
 
 No torch, no GPU. Only pandas + pyarrow (+ numpy). Nothing is decoded from the
 image column; we only inspect its type.
@@ -110,9 +109,9 @@ def skew_report(df: pd.DataFrame, center_col: str, label_col: str) -> None:
     print("    normH -> 0.0  = each center sees ~1 class  (extreme incomplete coverage, best for FedSRA)")
     print("    normH -> 1.0  = each center sees all classes uniformly (no label skew; FedSRA has no edge)")
     verdict = (
-        "STRONG skew -> in-regime, worth the make-or-break" if mean_normH < 0.6 else
-        "MODERATE skew -> borderline; check coverage/feature-shift before betting" if mean_normH < 0.8 else
-        "WEAK skew -> likely DomainNet-redux; do NOT bet make-or-break here"
+        "STRONG skew -> in-regime for FedSRA" if mean_normH < 0.6 else
+        "MODERATE skew -> borderline; check coverage/feature-shift" if mean_normH < 0.8 else
+        "WEAK skew -> mostly feature shift; out of regime for FedSRA"
     )
     print(f"\n  GATE VERDICT (heuristic): {verdict}")
     print("  (final call also needs feature-shift assessment; dermoscopy is same-modality so expected mild.)")

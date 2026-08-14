@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""RGA noise-cancellation diagnostics on Fed-ISIC2019 (answers R2-D1/W1, R3-W2).
+"""RGA noise-cancellation diagnostics on Fed-ISIC2019.
 
 Inference only. Loads the trained per-center ETF backbones, standardizes each
 client's features per-feature over the test set (Eq. 4), and measures the

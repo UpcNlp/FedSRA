@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fed-ISIC2019 natural-federation experiment for the FedSRA rebuttal (make-or-break).
+"""Fed-ISIC2019 natural-federation experiment for FedSRA.
 
 Natural clients = the 6 FLamby acquisition centers (column ``center``, 0..5).
 Task = 8-class skin-lesion classification (column ``label``, 0..7).
@@ -17,7 +17,7 @@ Two independently trained methods, one shared data split:
             served by one-shot FedAvg [single-model tier] and uniform / sqrt-size
             logit ensembles [O(K) tier].
 
-Fair tiered comparison (see REBUTTAL_EXECUTION_SPEC.md 2):
+Fair tiered comparison:
   Tier-1 single model : FedSRA is not single-model here; compare O-FedAvg vs best-single.
   Tier-2 O(K)         : FedSRA-RGA  vs  CE uniform/sqrt ensemble  (same inference budget).
 
@@ -491,7 +491,7 @@ def main() -> None:
     out_path = args.output / "results" / f"fedisic_{args.method}_s{args.seed}.json"
     atomic_json_dump(result, out_path)
 
-    # ── console head-to-head on pooled test (the make-or-break read) ──
+    # ── console head-to-head on pooled test ──
     print("\n" + "=" * 72)
     print(f"Fed-ISIC2019 pooled test  (seed={args.seed}, balanced-acc / macro-AUC / worst-class)")
     print("=" * 72)
