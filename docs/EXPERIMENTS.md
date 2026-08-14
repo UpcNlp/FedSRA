@@ -28,6 +28,8 @@ natural Fed-ISIC federation. Script: `src/eval_residual_diag.py`,
 Cancellation needs only weak cross-client correlation, strictly weaker than
 per-client zero mean.
 
+![Residual correlation vs coverage](../figures/residdiag_rho.png)
+
 ## 2. Neural-collapse threshold vs client count
 
 Aggregated NC1 = within-class scatter / between-class separation; above 1.0 the
@@ -60,6 +62,8 @@ accuracy drop is always K=20 to 50: 9.05, 8.45, 9.42, 10.16 points.
 With only 9 classes, NC1 never crosses 1.0 through K=50. The threshold is set by
 the class count, not universal.
 
+![Aggregated NC1 and accuracy vs client count on CIFAR-100](../figures/nc_threshold.png)
+
 ## 3. Medical and natural federations
 
 Against independently trained baselines (a real shared-initialization one-shot
@@ -78,6 +82,8 @@ At the most severe skew (alpha 0.05), absolute Top-1 is 82.2 / 84.5% (FedSRA) vs
 66.5 / 77.4% (FAFI), 54.6 / 64.2% (CE ensemble), 12.7 / 16.4% (one-shot FedAvg).
 Under 20% / 40% label noise FedSRA stays best or tied (PathMNIST 82.2 to 73.8 to
 71.1%); under MedMNIST-C corruption it holds 59.9 / 66.1%.
+
+![MedMNIST margin over baselines vs skew](../figures/medmnist.png)
 
 ### Fed-ISIC2019 (6 real FLamby centers, 8 classes, 144x144, natural partition)
 
@@ -110,6 +116,10 @@ Scripts: `src/eval_batch_zscore.py`, `experiments/fedisic_frozen.py`.
 | per-batch (naive) | 78.93 | 78.64 | 77.28 | 70.92 | 10.07 | 28.88 |
 
 Per-batch statistics collapse at batch size 1 and under class-sorted streams.
+Both batch-independent variants below are flat across batch size, and on
+Fed-ISIC the frozen variant matches the full-batch number.
+
+![Standardization robustness](../figures/standardization_robustness.png)
 
 ### 4.2 Batch-independent variant 1: frozen statistics (1,024 unlabeled samples)
 
@@ -142,6 +152,11 @@ and hold at batch size 1. Calibration-free (each client uploads its own
 training-feature mean/std, no buffer and no extra round) matches frozen within
 0.5 point across all CIFAR-100 cells; on CIFAR-10 it trails by up to 7.65 points
 under the most severe skew and by under 0.5 point as skew relaxes.
+
+![Calibration-free vs frozen across 16 cells](../figures/calibfree_vs_frozen.png)
+
+Every CIFAR-100 cell sits on the diagonal (calibration-free equals frozen); the
+CIFAR-10 gap appears only in the low-accuracy, severe-skew corner.
 
 ### 4.3 Fed-ISIC2019, balanced accuracy (3-seed mean +/- std)
 
@@ -194,3 +209,5 @@ trade-off, not a free reduction.
   66.5% (CIFAR-100) for FedSRA. A matched fixed-ETF FedAvg control still trails
   one-round FedSRA by at least 26 points after ten rounds under severe skew.
   Script: `src/train_multiround_etf.py`.
+
+![One-shot FedSRA vs multi-round control](../figures/multiround.png)
