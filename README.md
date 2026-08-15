@@ -6,14 +6,20 @@ server fuses the clients with Reliability-Guided Aggregation (RGA): per-client
 z-score standardization, sqrt(n)-weighted sum, post-L2 normalization, then
 nearest-ETF classification.
 
+**Full results, with figures and per-cell tables, are in
+[`docs/EXPERIMENTS.md`](docs/EXPERIMENTS.md):** aggregation reliability and direct
+residual-cancellation measurements, the neural-collapse threshold, medical and
+natural federations, batch-independent standardization, serving cost, and
+multi-round comparisons.
+
 ## Layout
 
 ```
 src/            method + CIFAR/Tiny-ImageNet experiments (ETF, RGA, grouped-merge,
                 scalability, R/I/J ablations, NC / residual diagnostics)
 experiments/    medical + natural-federation experiments (MedMNIST, Fed-ISIC2019)
-figures/        figure scripts and PDFs
-docs/           DATA.md, BASELINE_PROVENANCE.md, EXPERIMENTS.md
+figures/        result figures (PNG + PDF)
+docs/           EXPERIMENTS.md (detailed results), DATA.md, BASELINE_PROVENANCE.md
 ```
 
 ## Setup
@@ -83,6 +89,21 @@ python experiments/residdiag_medmnist.py --dataset pathmnist --data data/medmnis
     --alpha 0.05 --seed 42 --out out/residdiag_pathmnist_s42.json
 python experiments/ncsweep_medmnist.py   --dataset pathmnist --data data/medmnist/pathmnist.npz \
     --alpha 0.05 --K 20 --seed 42 --out out/ncsweep_pathmnist_k20.json
+```
+
+### Standardization and direct residual cancellation — `src/` + `experiments/`
+
+```bash
+# batch-size sensitivity + frozen calibration (CIFAR)
+python src/eval_batch_zscore.py --dataset cifar10 --alpha 0.05 --K 10 --save_dir <ckpt>
+# calibration-free (client-uploaded training moments), CIFAR
+python src/eval_trainstats.py   --dataset cifar100 --alpha 0.05 --K 10 --NL 100 --save_dir <ckpt>
+# frozen calibration on the real federation
+python experiments/fedisic_frozen.py --test_parquet $TE --ckpt_root out/fedisic/checkpoints
+# direct residual cancellation: R_before/R_after reduction + SNR vs accuracy
+python src/eval_resid_cancel.py        --dataset cifar100 --alpha 0.05 --K 10 --NL 100 --save_dir <ckpt>
+python experiments/pathmnist_cancel.py --data data/medmnist/pathmnist.npz --alpha 0.05 --K 5 --ckpt_root <ckpt>
+python experiments/fedisic_cancel.py   --train_parquet $TR --test_parquet $TE --ckpt_root out/fedisic/checkpoints
 ```
 
 ## Baselines
