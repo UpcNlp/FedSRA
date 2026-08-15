@@ -46,8 +46,11 @@ mean/std uses seeds 0, 42, 123.
 ### CIFAR / Tiny-ImageNet (main table, scalability, ablations) — `src/`
 
 ```bash
-python src/rebuild8_cifar100.py --alpha 0.05 --backbone resnet18 --seed 42 --n_clients 10
-python src/eval_ablation_RIJ.py    ...   # R/I/J loss ablation
+python src/rebuild8_cifar100.py     --alpha 0.05 --backbone resnet18 --seed 42 --n_clients 10
+python src/rebuild8_tinyimagenet.py --alpha 0.05 --backbone resnet18 --seed 42   # Tiny-ImageNet main table
+python src/eval_ablation_RIJ.py    ...   # R/I/J loss ablation (CIFAR)
+python src/run_ablation_RIJ_tiny.py ...  # R/I/J loss ablation (Tiny-ImageNet)
+python src/run_znorm_tinyimagenet.py --alpha 0.05 --n_clients 5 --seed 42   # Tiny-ImageNet scalability
 python src/measure_fednc.py --dataset cifar100 --alpha 0.05 --K 10 --variant J --save_dir <ckpt> --out <json>
 python src/eval_residual_diag.py --dataset cifar100 --alpha 0.05 --K 10 --save_dir <ckpt>
 python src/eval_grouped_merge_cost.py ...  # serving-cost / accuracy Pareto
