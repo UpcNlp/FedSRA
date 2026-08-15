@@ -6,9 +6,10 @@ Full supporting numbers for FedSRA. Runs are from scratch and use seeds 0, 42,
 
 ## 1. Aggregation reliability: do unseen-class residuals cancel?
 
-RGA sums per-client z-scored features with sqrt(sample-count) weights. A client
-that never saw a class can still emit a non-zero output on it, so we measure, per
-class, that residual and its cross-client correlation on three data families:
+RGA sums per-client z-scored (standardized) features with sqrt(sample-count)
+weights. A client that never saw a class can still emit a non-zero standardized
+feature on it, so we measure, per class, that residual and its cross-client
+correlation on three data families:
 CIFAR-10/100 (synthetic Dirichlet skew), MedMNIST colorectal histology, and the
 natural Fed-ISIC federation. Script: `src/eval_residual_diag.py`,
 `experiments/residdiag_*.py`.
@@ -29,6 +30,33 @@ Cancellation needs only weak cross-client correlation, strictly weaker than
 per-client zero mean.
 
 ![Residual correlation vs coverage](../figures/residdiag_rho.png)
+
+### Direct measurement of cancellation
+
+The measurements above verify the conditions for cancellation; we also measure
+the cancellation itself. For each test sample, over the clients that did not see
+its true class, with `r_k` the client's standardized feature and `w_k = sqrt(n_k)`:
+
+    R_before = sum_k w_k * ||r_k||      (magnitudes added, no cancellation)
+    R_after  = || sum_k w_k * r_k ||    (vector sum, cancellation allowed)
+    reduction = 1 - R_after / R_before
+
+reduction near 0 means the unseen clients reinforce one wrong direction; near 1
+means they cancel. Script: `src/eval_resid_cancel.py`.
+
+| dataset | reduction at alpha=0.05 | 0.1 | 0.3 | 0.5 |
+|---------|----|----|----|----|
+| CIFAR-10  (K=10 / K=20) | 46.6 / 56.6 | 40.1 / 51.4 | 15.0 / 19.3 | 0.0 / 7.3 |
+| CIFAR-100 (K=10 / K=20) | 48.6 / 62.0 | 42.8 / 56.3 | 20.2 / 41.6 | 9.5 / 23.9 |
+
+Under severe skew (alpha 0.05 to 0.1), where most clients are unseen and
+cancellation matters, the aggregated residual drops 40 to 62%. The reduction
+shrinks as skew relaxes and unseen clients become rare, at which point the signal
+already dominates. The effective SNR (seen-client signal divided by the
+post-aggregation residual) rises accordingly and correlates with accuracy across
+the 16 cells (Pearson 0.50, Spearman 0.51, both p < 0.05).
+
+![Residual reduction and SNR vs accuracy](../figures/residual_cancellation.png)
 
 ## 2. Neural-collapse threshold vs client count
 
