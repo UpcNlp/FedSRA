@@ -69,8 +69,6 @@ shared protocol; no objective or server code is modified.
 - **O-FedAvg** and the **CE ensemble** are standard and implemented by us
   (`src/`, `experiments/`): shared-initialization clients with, respectively, a
   sample-size-weighted parameter average and a uniform / sqrt(n) logit average.
-- **FedOV** is not compared: it requires auxiliary open-set / abstention
-  supervision the other methods do not use.
 
 See `../docs/BASELINE_PROVENANCE.md` for the full fairness protocol (shared
 partition, from-scratch training, seeds 0/42/123).

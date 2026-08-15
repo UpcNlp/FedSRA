@@ -21,7 +21,6 @@ left unchanged.
 | FuseFL | https://github.com/wizard1203/FuseFL | NeurIPS 2024 | dataset/config/reporting adapters | official, included |
 | FedCGS | https://github.com/Yuqin-G/FedCGS | AAAI 2025 | dataset/config/reporting adapters | official, included |
 | IntactOFL | https://github.com/zenghui9977/IntactOFL | ACM MM 2024 | dataset/config/reporting adapters | official, included |
-| FedOV | — | — | — | not compared: requires auxiliary open-set / abstention supervision the other methods do not use |
 
 ## Fairness controls
 
