@@ -58,6 +58,21 @@ the 16 cells (Pearson 0.50, Spearman 0.51, both p < 0.05).
 
 ![Residual reduction and SNR vs accuracy](../figures/residual_cancellation.png)
 
+The same measurement on all three data families (3-seed on the medical ones)
+shows cancellation everywhere it is possible, scaling with the number of unseen
+clients (skew severity times client count). Scripts: `experiments/pathmnist_cancel.py`,
+`experiments/fedisic_cancel.py`.
+
+| data family | setting | residual reduction | note |
+|-------------|---------|--------------------|------|
+| CIFAR-10/100 (synthetic) | severe skew, K=10 to 20 | 40 to 62% | many unseen clients to average |
+| PathMNIST (colorectal histology) | severe skew, K=5 | 20.0 +/- 1.8% | fewer clients (K=5) |
+| Fed-ISIC2019 (real federation) | natural partition | 7.8 +/- 0.4% | near-complete coverage (only 23% of samples have an unseen center) |
+
+The reduction is always positive, and it is largest exactly where incomplete
+coverage makes cancellation necessary; under near-complete coverage there is
+little residual to cancel and the seen-client signal already dominates.
+
 ## 2. Neural-collapse threshold vs client count
 
 Aggregated NC1 = within-class scatter / between-class separation; above 1.0 the
