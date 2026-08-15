@@ -1,8 +1,8 @@
-# Detailed experimental results
+# Extended experiments and analysis
 
-Full supporting numbers for FedSRA. Runs are from scratch and use seeds 0, 42,
-123 unless noted. Scripts for every table below live in `src/` and
-`experiments/`.
+Additional experiments for FedSRA, beyond the main-paper tables. Runs are from
+scratch and use seeds 0, 42, 123 unless noted. Scripts for every table below live
+in `src/` and `experiments/`.
 
 ## 1. Aggregation reliability: do unseen-class residuals cancel?
 

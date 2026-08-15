@@ -6,11 +6,11 @@ server fuses the clients with Reliability-Guided Aggregation (RGA): per-client
 z-score standardization, sqrt(n)-weighted sum, post-L2 normalization, then
 nearest-ETF classification.
 
-**Full results, with figures and per-cell tables, are in
-[`docs/EXPERIMENTS.md`](docs/EXPERIMENTS.md):** aggregation reliability and direct
-residual-cancellation measurements, the neural-collapse threshold, medical and
-natural federations, batch-independent standardization, serving cost, and
-multi-round comparisons.
+**Extended experiments and analysis (beyond the main-paper tables), with figures
+and per-cell numbers, are in [`docs/EXPERIMENTS.md`](docs/EXPERIMENTS.md):**
+aggregation reliability and direct residual-cancellation measurements, the
+neural-collapse threshold, medical and natural federations, batch-independent
+standardization, serving cost, and multi-round comparisons.
 
 ## Layout
 
@@ -19,7 +19,7 @@ src/            method + CIFAR/Tiny-ImageNet experiments (ETF, RGA, grouped-merg
                 scalability, R/I/J ablations, NC / residual diagnostics)
 experiments/    medical + natural-federation experiments (MedMNIST, Fed-ISIC2019)
 figures/        result figures (PNG + PDF)
-docs/           EXPERIMENTS.md (detailed results), DATA.md, BASELINE_PROVENANCE.md
+docs/           EXPERIMENTS.md (extended experiments), DATA.md, BASELINE_PROVENANCE.md
 ```
 
 ## Setup
